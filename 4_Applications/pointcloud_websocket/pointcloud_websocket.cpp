@@ -1,6 +1,7 @@
 #include "4_Applications/pointcloud_websocket/pointcloud_websocket.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <iostream>
@@ -61,6 +62,9 @@ std::string current_exception_message() {
 
 void validate_pointcloud_websocket_config(
     const PointCloudWebSocketConfig& config) {
+    if (config.gaussian_map && (!std::isfinite(config.gaussian_corner_radius_m) ||
+        config.gaussian_corner_radius_m < 0 || config.gaussian_corner_radius_m > models::maximum_gaussian_corner_radius_m))
+        throw std::invalid_argument("GaussianMapCornerRadiusMeters must be between 0 and 3 m");
     if (config.bind_address.empty()) {
         throw std::invalid_argument(
             "point-cloud WebSocket bind address cannot be empty");

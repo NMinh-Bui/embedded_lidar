@@ -410,6 +410,8 @@ AppConfig parse_device_config_text(const std::string& contents) {
                     maximum_reconnect_interval_seconds));
         } else if (key == "gaussianmapenabled") {
             config.gaussian_map.enabled=parse_boolean(value,"GaussianMapEnabled");
+        } else if (key == "gaussianmapcornerradiusmeters") {
+            config.gaussian_map_websocket.gaussian_corner_radius_m = parse_float(value,"GaussianMapCornerRadiusMeters");
         } else if (key == "gaussianmapwebsocketbindaddress") {
             config.gaussian_map_websocket.bind_address=value;
         } else if (key == "gaussianmapwebsocketport") {

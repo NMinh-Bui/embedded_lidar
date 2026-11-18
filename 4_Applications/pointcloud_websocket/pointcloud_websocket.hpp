@@ -34,6 +34,7 @@ struct PointCloudWebSocketConfig {
     bool include_ground_status{true};
     bool gaussian_map{false};
     std::shared_ptr<MappingPoseControl> mapping_control;
+    double gaussian_corner_radius_m{models::default_gaussian_corner_radius_m};
 };
 
 void validate_pointcloud_websocket_config(

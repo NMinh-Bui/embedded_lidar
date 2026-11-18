@@ -87,7 +87,19 @@ models::RoomMapViewRequest parse_room_map_view_request(const std::string& text,s
     std::string extra;
     if(input>>extra) {
         if(extra=="EDGES") result.surface_mode=GaussianSurfaceMode::edges;
-        else if(extra=="CORNERS") result.surface_mode=GaussianSurfaceMode::corners;
+        else if(extra=="CORNERS") {
+            result.surface_mode=GaussianSurfaceMode::corners;
+            if (input>>extra) {
+                std::istringstream radius_text(extra);
+                radius_text.imbue(std::locale::classic());
+                double radius{};
+                char extra_character{};
+                if (!(radius_text>>radius) || (radius_text>>extra_character) ||
+                    !std::isfinite(radius) || radius<0 || radius>models::maximum_gaussian_corner_radius_m)
+                    throw std::invalid_argument("invalid Gaussian corner radius");
+                result.gaussian_corner_radius_m=radius;
+            }
+        }
         else if(extra!="FULL") throw std::invalid_argument("invalid surface mode");
         if(input>>extra) throw std::invalid_argument("unexpected room-map view fields");
     }
@@ -110,6 +122,7 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                 models::RoomMapState sent_state{models::RoomMapState::empty};
                 bool delivered{};
                 GaussianSurfaceMode sent_mode{GaussianSurfaceMode::full_surface};
+                std::optional<double> sent_corner_radius;
                 std::chrono::steady_clock::time_point next_send{};
             };
             PointCloudWebSocketReport report;
@@ -161,9 +174,11 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                             continue;
                         }
                         try {
-                            const auto request=parse_room_map_view_request(incoming.text,config.maximum_points);
+                            auto request=parse_room_map_view_request(incoming.text,config.maximum_points);
                             if(request.surface_mode!=GaussianSurfaceMode::full_surface && !config.gaussian_map)
                                 throw std::invalid_argument("surface mode requires Gaussian map");
+                            if (request.surface_mode==GaussianSurfaceMode::corners && !request.gaussian_corner_radius_m)
+                                request.gaussian_corner_radius_m=config.gaussian_corner_radius_m;
                             found->second.request=request;
                             found->second.requested_signature=incoming.text;
                         } catch(const std::exception&) {
@@ -185,7 +200,8 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                         auto& view=entry.second;
                         const bool map_changed=!view.delivered || view.sent_revision!=latest->revision ||
                             view.sent_state!=latest->state;
-                        const bool mode_changed=view.delivered && view.sent_mode!=view.request.surface_mode;
+                        const bool mode_changed=view.delivered && (view.sent_mode!=view.request.surface_mode ||
+                            view.sent_corner_radius!=view.request.gaussian_corner_radius_m);
                         if(!map_changed && !mode_changed && (now<view.next_send ||
                             view.sent_signature==view.requested_signature)) continue;
                         // The producer has ALREADY checkpointed this revision at
@@ -217,8 +233,13 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                             <<",\"state\":"<<static_cast<unsigned>(state)
                             <<",\"mappingGeneration\":"<<latest->mapping_generation<<",\"bounds\":[";
                         for(unsigned i=0;i<6;++i) {if(i) meta<<',';meta<<bounds[i];}meta<<"]";
-                        if(config.gaussian_map) meta<<",\"supportsEdges\":true,\"supportsCorners\":true,\"surfaceMode\":\""
-                            <<surface_mode_name(view.request.surface_mode)<<'"';
+                        if(config.gaussian_map) {
+                            meta<<",\"supportsEdges\":true,\"supportsCorners\":true,\"surfaceMode\":\""
+                                <<surface_mode_name(view.request.surface_mode)<<'"'
+                                <<",\"defaultCornerRadiusMeters\":"<<config.gaussian_corner_radius_m;
+                            if (view.request.gaussian_corner_radius_m)
+                                meta<<",\"cornerRadiusMeters\":"<<*view.request.gaussian_corner_radius_m;
+                        }
                         meta<<'}';
                         cloud.timestamp_ns=latest->timestamp_ns;
                         models::RoomMapMessage frame(latest->revision,
@@ -230,6 +251,7 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                             report.encoded_points+=config.gaussian_map?splats.size():frame.payload.points.size();
                             view.delivered=true;view.sent_revision=latest->revision;view.sent_state=latest->state;
                             view.sent_mode=view.request.surface_mode;
+                            view.sent_corner_radius=view.request.gaussian_corner_radius_m;
                             view.sent_signature=view.requested_signature;
                         }
                         // Bound repeated camera queries without delaying a new map.

@@ -238,6 +238,30 @@ VISTA_TEST(gaussian_corners_require_three_faces_and_keep_one_vertex_across_tiles
     VISTA_CHECK_NEAR(corners[0].center.x,.325F,.11F);
     VISTA_CHECK_NEAR(corners[0].center.y,-.375F,.11F);
     VISTA_CHECK_NEAR(corners[0].center.z,.025F,.11F);
+    const auto rebuilt=builder.rebuilt_tiles();
+    request.gaussian_corner_radius_m=.35;
+    const auto near=first->select_splats(request);
+    VISTA_CHECK(near.size()>corners.size());
+    VISTA_CHECK(near.front().center==corners.front().center);
+    bool different_tile=false;
+    for (std::size_t i=1;i<near.size();++i) {
+        const auto& edge=near[i].center;
+        const auto& center=corners.front().center;
+        const double x=edge.x-center.x,y=edge.y-center.y,z=edge.z-center.z;
+        VISTA_CHECK(x*x+y*y+z*z<=.35*.35+1e-6);
+        VISTA_CHECK(!(edge==center));
+        different_tile=different_tile || std::floor(edge.x/.4F)!=std::floor(center.x/.4F) ||
+            std::floor(edge.y/.4F)!=std::floor(center.y/.4F) || std::floor(edge.z/.4F)!=std::floor(center.z/.4F);
+    }
+    VISTA_CHECK(different_tile);
+    request.gaussian_corner_radius_m=.90;
+    VISTA_CHECK(first->select_splats(request).size()>near.size());
+    request.point_budget=1;
+    const auto one=first->select_splats(request);
+    VISTA_CHECK(one.size()==1 && one.front().center==corners.front().center);
+    VISTA_CHECK(builder.rebuilt_tiles()==rebuilt);
+    request.point_budget=250'000;
+    request.gaussian_corner_radius_m.reset();
     request.has_camera=true;
     request.planes[0]={1,0,0,-1.2};
     VISTA_CHECK(first->select_splats(request).empty());
@@ -248,6 +272,9 @@ VISTA_TEST(gaussian_corners_require_three_faces_and_keep_one_vertex_across_tiles
     const auto next=builder.update(*s->view_source(2)->surface_snapshot());
     VISTA_CHECK(next->select_splats(request).empty());
     VISTA_CHECK(first->select_splats(request).size()==1);
+    request.gaussian_corner_radius_m=.35;
+    VISTA_CHECK(next->select_splats(request).empty());
+    VISTA_CHECK(first->select_splats(request).size()==near.size());
     request.surface_mode=GaussianSurfaceMode::edges;
     VISTA_CHECK(!next->select_splats(request).empty());
 }

@@ -292,6 +292,7 @@ struct Page {
     std::shared_ptr<transport::detail::SessionDirectory> directory;
     vista::fs::path file;
     std::uint64_t count{},edge_count{},corner_count{};
+    std::vector<models::RoomMapPoint> corner_centers;
     std::array<double,6> bounds{};
 
     std::pair<std::uint64_t,std::uint64_t> range(models::GaussianSurfaceMode mode) const {
@@ -304,46 +305,156 @@ struct Page {
     }
     ~Page() {std::error_code ignored;vista::fs::remove(file,ignored);}
 };
+using CornerGrid = std::unordered_map<Voxel,std::vector<models::RoomMapPoint>,transport::MapVoxelHash>;
+
+// Each eligible edge adds only its distance and index to the cache. The
+// Gaussian records stay in the existing geometry page, shared with Edges.
+struct CornerEdgeIndex {
+    std::shared_ptr<transport::detail::SessionDirectory> directory;
+    vista::fs::path file;
+    std::uint64_t count{};
+
+    template <typename T>
+    static T read(std::istream& input, std::uint64_t offset) {
+        T value{};
+        input.seekg(static_cast<std::streamoff>(offset));
+        input.read(reinterpret_cast<char*>(&value),sizeof(value));
+        if (!input) throw std::runtime_error("truncated Gaussian corner edge index");
+        return value;
+    }
+
+    std::uint64_t count_within(double radius) const {
+        vista::io::ifstream input(file,std::ios::binary);
+        const auto squared=radius*radius;
+        std::uint64_t low{}, high=count;
+        while (low<high) {
+            const auto middle=low+(high-low)/2;
+            if (read<double>(input,middle*sizeof(double))<=squared) low=middle+1;
+            else high=middle;
+        }
+        return low;
+    }
+
+    std::uint32_t original_edge(std::istream& input, std::uint64_t index) const {
+        return read<std::uint32_t>(input,count*sizeof(double)+index*sizeof(std::uint32_t));
+    }
+
+    ~CornerEdgeIndex() {std::error_code ignored;vista::fs::remove(file,ignored);}
+};
+
+std::shared_ptr<const CornerEdgeIndex> index_corner_edges(const Page& page, const CornerGrid& grid,
+    vista::fs::path file, const std::function<bool()>& cancelled) {
+    constexpr auto radius=models::maximum_gaussian_corner_radius_m;
+    constexpr auto radius_squared=radius*radius;
+    struct Entry { double squared; std::uint32_t index; };
+    std::vector<Entry> ranked;
+    vista::io::ifstream input(page.file,std::ios::binary);
+    input.seekg(static_cast<std::streamoff>(page.count*record_bytes));
+    for (std::uint32_t i=0;i<page.edge_count;++i) {
+        if (i%256==0 && cancelled && cancelled()) return {};
+        const auto center=read_point(input).center;
+        const auto bucket=voxel(center,static_cast<float>(radius));
+        auto closest=std::numeric_limits<double>::infinity();
+        for (int dx=-1;dx<=1;++dx) for (int dy=-1;dy<=1;++dy) for (int dz=-1;dz<=1;++dz) {
+            const auto found=grid.find({bucket.x+dx,bucket.y+dy,bucket.z+dz});
+            if (found==grid.end()) continue;
+            for (const auto& corner : found->second) {
+                const auto delta=displacement(center,corner);
+                closest=std::min(closest,dot(delta,delta));
+            }
+        }
+        // Keep a marker as the only representation of its own center.
+        if (closest>0 && closest<=radius_squared) ranked.push_back({closest,i});
+    }
+    if (ranked.empty()) return {};
+    std::sort(ranked.begin(),ranked.end(),[](const Entry& a,const Entry& b) {
+        return std::tie(a.squared,a.index)<std::tie(b.squared,b.index);
+    });
+    auto index=std::make_shared<CornerEdgeIndex>();
+    index->directory=page.directory;
+    index->file=std::move(file);
+    index->count=ranked.size();
+    vista::io::ofstream output(index->file,std::ios::binary|std::ios::trunc);
+    for (const auto& edge : ranked)
+        output.write(reinterpret_cast<const char*>(&edge.squared),sizeof(edge.squared));
+    for (const auto& edge : ranked)
+        output.write(reinterpret_cast<const char*>(&edge.index),sizeof(edge.index));
+    output.flush();
+    if (!output) throw std::runtime_error("cannot write Gaussian corner edge index");
+    return index;
+}
+
 class View final : public models::GaussianMapViewSource {
 public:
     std::map<Key,std::shared_ptr<const Page>> pages;
+    std::map<Key,std::shared_ptr<const CornerEdgeIndex>> corner_edges;
     std::array<double,6> box{-1,-1,-1,1,1,1};
     std::array<double,6> bounds() const override {return box;}
+
     std::vector<Point> select_splats(const models::RoomMapViewRequest& request) const override {
         if(!request.point_budget || request.point_budget>2'000'000) throw std::invalid_argument("invalid Gaussian view budget");
-        std::vector<std::shared_ptr<const Page>> visible;std::uint64_t total{};
+        const auto radius=request.gaussian_corner_radius_m.value_or(0);
+        if (!std::isfinite(radius) || radius<0 || radius>models::maximum_gaussian_corner_radius_m)
+            throw std::invalid_argument("invalid Gaussian corner radius");
+        const bool near_corners=request.surface_mode==models::GaussianSurfaceMode::corners && radius>0;
+        struct Slice {
+            const Page* page;
+            std::uint64_t offset,count;
+            const CornerEdgeIndex* index{};
+        };
+        std::vector<Slice> primary, nearby;
+        std::uint64_t primary_count{}, nearby_count{};
         for(const auto& entry:pages) {
-            const auto& page=entry.second;bool outside=false;
+            const auto& page=*entry.second;bool outside=false;
             if(request.has_camera) for(const auto& plane:request.planes) {
-                const auto& b=page->bounds;
+                const auto& b=page.bounds;
                 if(plane[0]*b[plane[0]>=0?3:0]+plane[1]*b[plane[1]>=0?4:1]+
                    plane[2]*b[plane[2]>=0?5:2]+plane[3]<0) {outside=true;break;}
             }
-            const auto count=page->range(request.surface_mode).second;
-            if(!outside && count) {visible.push_back(page);total+=count;}
-        }
-        std::vector<Point> result;result.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(total,request.point_budget)));
-        // Fixed-width random access bounds disk reads by the view budget, not map size.
-        const auto wanted=std::min<std::uint64_t>(total,request.point_budget);
-        std::uint64_t base{},sample_index{};
-        for(const auto& page:visible) {
-            vista::io::ifstream in(page->file,std::ios::binary);
-            const auto [offset,count]=page->range(request.surface_mode);
-            if(offset) in.seekg(static_cast<std::streamoff>(offset*record_bytes));
-            std::uint64_t next_record{};
-            while(sample_index<wanted) {
-                const auto index=static_cast<std::uint64_t>((static_cast<long double>(sample_index)+.5L)*total/wanted);
-                if(index>=base+count) break;
-                if(index-base!=next_record)in.seekg(static_cast<std::streamoff>((offset+index-base)*record_bytes));
-                next_record=index-base+1;
-                auto p=read_point(in);bool inside=true;
-                if(request.has_camera) for(const auto& plane:request.planes)
-                    if(plane[0]*p.center.x+plane[1]*p.center.y+plane[2]*p.center.z+plane[3]<0) {inside=false;break;}
-                if(inside) result.push_back(p);
-                ++sample_index;
+            if (outside) continue;
+            const auto [offset,count]=page.range(request.surface_mode);
+            if (count) { primary.push_back({&page,offset,count});primary_count+=count; }
+            if (near_corners) {
+                const auto found=corner_edges.find(entry.first);
+                if (found!=corner_edges.end()) {
+                    const auto matches=found->second->count_within(radius);
+                    if (matches) {
+                        nearby.push_back({&page,page.count,matches,found->second.get()});
+                        nearby_count+=matches;
+                    }
+                }
             }
-            base+=count;
         }
+        std::vector<Point> result;
+        result.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(primary_count+nearby_count,request.point_budget)));
+        const auto sample=[&](const std::vector<Slice>& slices,std::uint64_t total) {
+            const auto wanted=std::min<std::uint64_t>(total,request.point_budget-result.size());
+            std::uint64_t base{},sample_index{};
+            for (const auto& slice:slices) {
+                if (sample_index==wanted) break;
+                vista::io::ifstream input(slice.page->file,std::ios::binary);
+                vista::io::ifstream ranks;
+                if (slice.index) ranks.open(slice.index->file,std::ios::binary);
+                auto next_record=std::numeric_limits<std::uint64_t>::max();
+                while(sample_index<wanted) {
+                    const auto index=static_cast<std::uint64_t>((static_cast<long double>(sample_index)+.5L)*total/wanted);
+                    if(index>=base+slice.count) break;
+                    const auto local=index-base;
+                    const auto record=slice.offset+(slice.index?slice.index->original_edge(ranks,local):local);
+                    if(record!=next_record) input.seekg(static_cast<std::streamoff>(record*record_bytes));
+                    next_record=record+1;
+                    auto p=read_point(input);bool inside=true;
+                    if(request.has_camera) for(const auto& plane:request.planes)
+                        if(plane[0]*p.center.x+plane[1]*p.center.y+plane[2]*p.center.z+plane[3]<0) {inside=false;break;}
+                    if(inside) result.push_back(p);
+                    ++sample_index;
+                }
+                base+=slice.count;
+            }
+        };
+        // Commit the vertex markers first so a tight budget still shows corners.
+        sample(primary,primary_count);
+        sample(nearby,nearby_count);
         return result;
     }
 };
@@ -382,7 +493,8 @@ std::shared_ptr<const models::GaussianMapViewSource> GaussianMapBuilder::update(
     }
     for(const auto& entry:impl_->processed) if(!source.regions.count(entry.first)) changed.insert(entry.first);
     if(changed.empty()) return impl_->view;
-    auto next=std::make_shared<View>(*impl_->view);if(dimensions) next->pages.clear();
+    auto next=std::make_shared<View>(*impl_->view);
+    if(dimensions) {next->pages.clear();next->corner_edges.clear();}
     std::set<Key> affected;
     const double margin=(tile_halo_cells+.01)*source.voxel_size;
     const int reach=static_cast<int>(std::ceil(margin/source.tile_size));
@@ -448,10 +560,50 @@ std::shared_ptr<const models::GaussianMapViewSource> GaussianMapBuilder::update(
             marker.opacity=.98F;
             write_point(out,marker);
             ++page->corner_count;
+            page->corner_centers.push_back(marker.center);
         }
         out.flush();if(!out) throw std::runtime_error("cannot flush Gaussian cache");out.close();
         next->pages.insert_or_assign(k,std::move(page));++impl_->rebuilt;
     }
+    CornerGrid corners_in_map;
+    for (const auto& entry : next->pages) for (const auto& center : entry.second->corner_centers) {
+        const auto bucket=voxel(center,static_cast<float>(models::maximum_gaussian_corner_radius_m));
+        corners_in_map[bucket].push_back(center);
+    }
+    if (corners_in_map.empty()) next->corner_edges.clear();
+    else {
+        auto refresh_edges=affected;
+        if (dimensions) for (const auto& entry : next->pages) refresh_edges.insert(entry.first);
+        const auto edge_reach=static_cast<std::int64_t>(
+            std::ceil(models::maximum_gaussian_corner_radius_m/source.tile_size));
+        const auto corner_centers=[](const View& view,const Key& key) -> const std::vector<models::RoomMapPoint>& {
+            static const std::vector<models::RoomMapPoint> empty;
+            const auto page=view.pages.find(key);
+            return page==view.pages.end()?empty:page->second->corner_centers;
+        };
+        for (const auto& key : affected) {
+            if (corner_centers(*impl_->view,key)==corner_centers(*next,key)) continue;
+            // Find existing pages in the tile range, including across the
+            // origin. Iterating the sparse catalog avoids a dense radius cube.
+            const auto minimum=std::numeric_limits<std::int64_t>::min();
+            for (auto page=next->pages.lower_bound({key[0]-edge_reach,minimum,minimum});
+                 page!=next->pages.end() && page->first[0]<=key[0]+edge_reach;++page) {
+                if (std::abs(page->first[1]-key[1])<=edge_reach &&
+                    std::abs(page->first[2]-key[2])<=edge_reach) refresh_edges.insert(page->first);
+            }
+        }
+        for (const auto& key : refresh_edges) {
+            if (cancelled && cancelled()) return {};
+            next->corner_edges.erase(key);
+            const auto found=next->pages.find(key);
+            if (found==next->pages.end() || !found->second->edge_count) continue;
+            const auto path=impl_->root/(std::to_string(++impl_->serial)+".gcorner");
+            auto index=index_corner_edges(*found->second,corners_in_map,path,cancelled);
+            if (cancelled && cancelled()) return {};
+            if (index) next->corner_edges.emplace(key,std::move(index));
+        }
+    }
+
     if(!next->pages.empty()) {
         next->box={std::numeric_limits<double>::infinity(),std::numeric_limits<double>::infinity(),std::numeric_limits<double>::infinity(),
             -std::numeric_limits<double>::infinity(),-std::numeric_limits<double>::infinity(),-std::numeric_limits<double>::infinity()};

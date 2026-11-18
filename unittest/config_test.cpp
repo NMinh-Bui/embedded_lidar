@@ -43,6 +43,14 @@ std::string read_config_test_file(const vista::fs::path& file) {
 
 }  // namespace
 
+VISTA_TEST(gaussian_corner_radius_config_defaults_and_rejects_out_of_range) {
+    const std::string source=quanergy_config;
+    VISTA_CHECK(vista::parse_device_config_text(source).gaussian_map_websocket.gaussian_corner_radius_m==1.5);
+    VISTA_CHECK(vista::parse_device_config_text(source+"\nGaussianMapCornerRadiusMeters: 1.75\n")
+        .gaussian_map_websocket.gaussian_corner_radius_m==1.75);
+    VISTA_CHECK_THROWS(vista::parse_device_config_text(source+"\nGaussianMapCornerRadiusMeters: 3.1\n"));
+}
+
 VISTA_TEST(config_bootstrap_creates_valid_defaults_and_blank_token_in_unicode_directory) {
     ConfigTestDirectory tree;
     const auto folder = tree.root / vista::fs::u8path(u8"first run space \u00e9");
