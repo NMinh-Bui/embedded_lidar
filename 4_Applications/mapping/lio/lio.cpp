@@ -23,11 +23,13 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
     auto imu=inputs.subscribe<models::ImuMessage>(bus,models::topics::lidar_imu);
     auto world=bus.publisher<devices::LidarPointCloudMessage>(models::topics::pointcloud_world);
     auto telemetry=bus.publisher<models::LocalizationStatus>(models::topics::localization_status);
+    auto lidar_pose=bus.publisher<models::LidarPoseStatus>(models::topics::lidar_pose);
     return platform::spawn_worker(std::move(thread),[stop,config,inputs=std::move(inputs),cloud=std::move(cloud),
         imu=std::move(imu),world=std::move(world),telemetry=std::move(telemetry),on_complete=std::move(on_complete),
-        mapping_control=std::move(mapping_control)]() mutable {
+        mapping_control=std::move(mapping_control),lidar_pose=std::move(lidar_pose)]() mutable {
+        MappingPose active;
+        std::optional<models::LidarPose> accepted_pose;
         try {
-            MappingPose active;
             if (mapping_control) {
                 active = mapping_control->status().active;
                 const auto& mount = active.mount;
@@ -55,6 +57,8 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
             struct Pending { std::shared_ptr<const devices::LidarPointCloudMessage> message;double begin,end;std::chrono::steady_clock::time_point arrival; };
             std::deque<Pending> pending;
             auto heartbeat=std::chrono::steady_clock::now();auto last_valid=heartbeat;
+            auto next_pose=heartbeat;
+            std::optional<models::LidarPoseState> sent_pose_state;
             std::optional<models::LocalizationState> published_state;bool published_valid{};
             auto reset_temporal=[&](const std::string& reason) {
                 recovery_reason=reason;++recovery_count;
@@ -72,17 +76,9 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
                 latest.state = models::LocalizationState::fixed_mount;
                 latest.reason = "Fixed Mount pose; Point-LIO disabled";
                 latest.pose_valid = true;
-                const auto& mount = active.mount;
-                latest.position_m = {mount.mount_x_m, mount.mount_y_m, mount.mount_z_m};
-                constexpr double half_rad = 3.14159265358979323846 / 360.0;
-                const auto sr = std::sin(mount.mount_roll_deg * half_rad);
-                const auto cr = std::cos(mount.mount_roll_deg * half_rad);
-                const auto sp = std::sin(mount.mount_pitch_deg * half_rad);
-                const auto cp = std::cos(mount.mount_pitch_deg * half_rad);
-                const auto sy = std::sin(mount.mount_yaw_deg * half_rad);
-                const auto cy = std::cos(mount.mount_yaw_deg * half_rad);
-                latest.orientation_xyzw = {sr*cp*cy - cr*sp*sy, cr*sp*cy + sr*cp*sy,
-                                           cr*cp*sy - sr*sp*cy, cr*cp*cy + sr*sp*sy};
+                const auto pose = pose_from_mount(active.mount);
+                latest.position_m = pose.position_m;
+                latest.orientation_xyzw = pose.orientation_xyzw;
             };
             if (!engine) set_fixed_pose();
 
@@ -90,6 +86,8 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
             const auto apply_mapping_pose = [&](const MappingPose& requested) {
                 const auto old = active;
                 active = requested;
+                accepted_pose.reset();
+                sent_pose_state.reset();
                 const auto& mount = active.mount;
                 config.initial_position_m = {mount.mount_x_m, mount.mount_y_m, mount.mount_z_m};
                 config.initial_rpy_deg = {mount.mount_roll_deg, mount.mount_pitch_deg, mount.mount_yaw_deg};
@@ -283,7 +281,11 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
                     const LioScanView scan{frame,p.begin,p.end,*batch,point_reference};
                     auto output=engine->process(scan);latest=std::move(output.status);previous_end=p.end;
                     if(const auto integrated=engine->propagation_time_s())sync.retain_from(*integrated);
-                    if (output.world_cloud) publish_world(*p.message, std::move(*output.world_cloud));
+                    if (output.world_cloud) {
+                        if (latest.pose_valid && latest.state==models::LocalizationState::tracking)
+                            accepted_pose=models::LidarPose{latest.position_m,latest.orientation_xyzw};
+                        publish_world(*p.message, std::move(*output.world_cloud));
+                    }
                     else ++report.rejected;
                     pending.pop_front();
                     break;
@@ -301,6 +303,22 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
                     reset_temporal(latest.reason);
                 }
                 if(engine && latest.pose_valid && now-last_valid>config.synchronization_timeout){latest.pose_valid=false;latest.state=models::LocalizationState::degraded;latest.reason="no fresh localized scan (input/processing delay); map held";}
+                // The map marker is independent of the 1 Hz health publication.
+                // Never promote an unaccepted prediction to the last known pose.
+                auto pose_state=models::LidarPoseState::unavailable;
+                auto display_pose=accepted_pose;
+                if(latest.pose_valid && latest.state==models::LocalizationState::fixed_mount) {
+                    pose_state=models::LidarPoseState::fixed_mount;
+                    display_pose=models::LidarPose{latest.position_m,latest.orientation_xyzw};
+                } else if(accepted_pose) {
+                    pose_state=latest.pose_valid && latest.state==models::LocalizationState::tracking ?
+                        models::LidarPoseState::tracking : models::LidarPoseState::last_known;
+                }
+                if(now>=next_pose || sent_pose_state!=pose_state) {
+                    lidar_pose.publish(models::LidarPoseStatus{pose_state,display_pose,active.generation});
+                    sent_pose_state=pose_state;
+                    next_pose=now+std::chrono::milliseconds(200);
+                }
                 // Fault/recovery transitions are delivered immediately; the 1 s
                 // heartbeat is monitoring cadence, not permission to hide LOST.
                 if(now>=heartbeat || !published_state || *published_state!=latest.state || published_valid!=latest.pose_valid) {
@@ -321,7 +339,13 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
             }
             report.dropped+=cloud.dropped_messages()+imu.dropped_messages();
             on_complete(report,{});
-        }catch(const std::exception& error){models::LocalizationStatus status;status.state=models::LocalizationState::lost;status.reason=error.what();telemetry.publish(status);on_complete(std::nullopt,error.what());}
+        }catch(const std::exception& error){
+            models::LocalizationStatus status;status.state=models::LocalizationState::lost;
+            status.reason=error.what();telemetry.publish(status);
+            lidar_pose.publish(models::LidarPoseStatus{accepted_pose?models::LidarPoseState::last_known:
+                models::LidarPoseState::unavailable,accepted_pose,active.generation});
+            on_complete(std::nullopt,error.what());
+        }
     });
 }
 } // namespace vista::application

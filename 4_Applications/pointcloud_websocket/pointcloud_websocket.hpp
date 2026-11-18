@@ -13,6 +13,7 @@
 #include "1_Platform/threading/threading.hpp"
 #include "3_Devices/lidars/lidar.hpp"
 #include "models/mapping/ground_status.hpp"
+#include "models/mapping/lidar_pose.hpp"
 #include "models/mapping/room_map.hpp"
 
 namespace vista::application {
@@ -35,6 +36,8 @@ struct PointCloudWebSocketConfig {
     bool gaussian_map{false};
     std::shared_ptr<MappingPoseControl> mapping_control;
     double gaussian_corner_radius_m{models::default_gaussian_corner_radius_m};
+    // Static fallback when the localization worker is deliberately disabled.
+    std::optional<models::LidarPose> fixed_lidar_pose;
 };
 
 void validate_pointcloud_websocket_config(

@@ -224,6 +224,10 @@ void run_capture(AppConfig active, std::string device_text, const std::optional<
             runtime.threads.localization.enabled = true;
         }
         config.foreground.require_localization = runtime.threads.localization.enabled;
+        const auto fixed_pose = runtime.threads.localization.enabled ? std::optional<models::LidarPose>{} :
+            pose_from_mount(config.mounting.value_or(MountingConfig{}));
+        config.room_map_websocket.fixed_lidar_pose = fixed_pose;
+        config.gaussian_map_websocket.fixed_lidar_pose = fixed_pose;
         platform::validate_worker_selection(config,runtime);
 
         const auto& t = runtime.threads;

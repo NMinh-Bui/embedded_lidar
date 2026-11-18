@@ -640,7 +640,7 @@ platform::WorkerHandle spawn_gaussian_map_worker(platform::MessageBus& bus,platf
         try {
             GaussianMapBuilder builder(config.storage_directory);GaussianMapReport report;
             std::shared_ptr<const models::RoomMapSurfaceSnapshot> previous;
-            std::shared_ptr<const models::GaussianMapViewSource> view;std::uint64_t revision{};
+            std::shared_ptr<const models::GaussianMapViewSource> view;std::uint64_t revision{},mapping_generation{};
             std::string last_error;
             while(!stop.is_stop_requested()) {
                 std::shared_ptr<const models::RoomMapViewMessage> latest,extra;
@@ -652,16 +652,20 @@ platform::WorkerHandle spawn_gaussian_map_worker(platform::MessageBus& bus,platf
                 try {
                     const auto snapshot=latest->source?latest->source->surface_snapshot():nullptr;
                     if(snapshot && !snapshot->error.empty()) throw std::runtime_error(snapshot->error);
-                    if(snapshot && (!previous || snapshot->geometry_revision!=previous->geometry_revision || snapshot->regions!=previous->regions)) {
+                    if(snapshot && (!previous || snapshot->geometry_revision!=previous->geometry_revision ||
+                        snapshot->regions!=previous->regions || latest->mapping_generation!=mapping_generation)) {
                         auto updated=builder.update(*snapshot,[&]{return stop.is_stop_requested();});if(!updated) break;
                         view=std::move(updated);previous=snapshot;++revision;++report.completed_revisions;
                     } else if(!snapshot) {view.reset();previous.reset();++revision;}
-                    publisher.publish(models::RoomMapViewMessage{view,revision,latest->timestamp_ns,latest->point_count,latest->state});
+                    mapping_generation=latest->mapping_generation;
+                    publisher.publish(models::RoomMapViewMessage{view,revision,latest->timestamp_ns,latest->point_count,latest->state,
+                        latest->checkpoint_monotonic_ns,mapping_generation});
                     last_error.clear();
                 } catch(const std::exception& error) {
                     ++report.failed_revisions;
                     if(last_error!=error.what()) {std::cerr<<"Gaussian map revision failed: "<<error.what()<<'\n';last_error=error.what();}
-                    publisher.publish(models::RoomMapViewMessage{nullptr,++revision,latest->timestamp_ns,0,models::RoomMapState::storage_error});
+                    publisher.publish(models::RoomMapViewMessage{nullptr,++revision,latest->timestamp_ns,0,models::RoomMapState::storage_error,
+                        latest->checkpoint_monotonic_ns,latest->mapping_generation});
                 }
             }
             report.rebuilt_tiles=builder.rebuilt_tiles();complete(report,{});

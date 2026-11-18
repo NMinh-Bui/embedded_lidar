@@ -11,6 +11,7 @@ inline constexpr const char* pointcloud_cleaned_sensor = "pointcloud/cleaned_sen
 // Motion-compensated localization outputs. Any active IMU uses lidar/imu above.
 inline constexpr const char* pointcloud_world = "localization/pointcloud_world";
 inline constexpr const char* localization_status = "localization/status";
+inline constexpr const char* lidar_pose = "localization/lidar_pose";
 // World-coordinate cloud including the floor, used by mapping and PCD logging.
 inline constexpr const char* pointcloud_cleaned = "pointcloud/cleaned";
 // Legacy identifiers retained for reference/codec tests; production creates no

@@ -454,10 +454,11 @@ VISTA_TEST(gaussian_worker_and_websocket_use_full_map_checkpoint_and_clear_load_
         ~Finish(){stop.request_stop();bus.close();worker.join();socket.join();}
     } finish{stop,bus,worker,socket};
     auto source=map.view_source();
-    publisher.publish({source,7,123,2,vista::models::RoomMapState::frozen});
+    publisher.publish({source,7,123,2,vista::models::RoomMapState::frozen,111,5});
     std::shared_ptr<const vista::models::RoomMapViewMessage> output;
     VISTA_CHECK(observer.receive_for(output,3s)==vista::platform::ReceiveStatus::message);
     VISTA_CHECK(output->source && output->state==vista::models::RoomMapState::frozen);
+    VISTA_CHECK(output->mapping_generation==5 && output->checkpoint_monotonic_ns==111);
     const auto revision=output->revision;
     std::this_thread::sleep_for(100ms);
     Client client;client.connect(config.port);client.handshake();
@@ -467,7 +468,7 @@ VISTA_TEST(gaussian_worker_and_websocket_use_full_map_checkpoint_and_clear_load_
     client.send_bytes(masked_text("VIEW 10 600 0 0 10 1 0 0 0 -1 0 0 100 0 1 0 100 0 -1 0 100 0 0 1 100 0 0 -1 100"));
     VISTA_CHECK(client.read_frame().first==1);
     VISTA_CHECK(client.read_frame().second.size()==32+44);
-    publisher.publish({source,8,124,2,vista::models::RoomMapState::frozen});
+    publisher.publish({source,8,124,2,vista::models::RoomMapState::frozen,111,5});
     VISTA_CHECK(observer.receive_for(output,2s)==vista::platform::ReceiveStatus::message);
     VISTA_CHECK(output->revision==revision); // No changed geometry: no rebuild/resend.
     publisher.publish({nullptr,9,125,0,vista::models::RoomMapState::load_error});
@@ -476,6 +477,67 @@ VISTA_TEST(gaussian_worker_and_websocket_use_full_map_checkpoint_and_clear_load_
     VISTA_CHECK(!stop.is_stop_requested());
     stop.request_stop();bus.close();worker.join();socket.join();
     VISTA_CHECK(build_error.empty() && socket_error.empty() && report && report->completed_revisions==1);
+}
+
+VISTA_TEST(lidar_pose_websocket_reports_tracking_last_known_and_fixed_mount) {
+    Runtime runtime;
+    using namespace vista;
+    for (const bool gaussian : {false, true}) {
+        platform::MessageBus bus;
+        platform::StopToken stop;
+        auto map = bus.publisher<models::RoomMapViewMessage>(
+            gaussian ? models::topics::gaussian_map_view : models::topics::room_map_view);
+        auto poses = bus.publisher<models::LidarPoseStatus>(models::topics::lidar_pose);
+        application::PointCloudWebSocketConfig config;
+        config.room_map_lod = true;
+        config.gaussian_map = gaussian;
+        config.port = available_port();
+        const models::LidarPose pose{{1, 2, 3}, {0, 0, 0, 1}};
+        if (gaussian) config.fixed_lidar_pose = pose;
+        auto worker = application::spawn_pointcloud_websocket(bus, {"lidar-pose-test", 4}, stop, config,
+            [](auto, auto) {});
+        struct Finish {
+            platform::StopToken& stop;
+            platform::MessageBus& bus;
+            platform::WorkerHandle& worker;
+            ~Finish() { stop.request_stop(); bus.close(); worker.join(); }
+        } finish{stop, bus, worker};
+        const auto generation = gaussian ? 0U : 7U;
+        map.publish({nullptr, 1, 1, 0, models::RoomMapState::empty, 0, generation});
+        std::this_thread::sleep_for(120ms);
+        Client client;
+        client.connect(config.port);
+        client.handshake();
+        const auto receive_text = [&] {
+            const auto packet = client.read_frame();
+            VISTA_CHECK(packet.first == 1);
+            return std::string(packet.second.begin(), packet.second.end());
+        };
+        VISTA_CHECK(receive_text().find(R"("supportsLidarPose":true)") != std::string::npos);
+        VISTA_CHECK(client.read_frame().first == 2);
+        client.send_bytes(masked_text("LIDAR POSE"));
+        const auto initial = receive_text();
+        VISTA_CHECK(initial.find(gaussian ? R"("state":"fixed_mount")" : R"("state":"unavailable")") != std::string::npos);
+        if (gaussian) {
+            VISTA_CHECK(initial.find(R"("position":[1,2,3])") != std::string::npos);
+            continue;
+        }
+        poses.publish({models::LidarPoseState::tracking, pose, generation});
+        const auto tracked = receive_text();
+        VISTA_CHECK(tracked.find(R"("state":"tracking")") != std::string::npos);
+        VISTA_CHECK(tracked.find(R"("mappingGeneration":7)") != std::string::npos);
+        VISTA_CHECK(tracked.find(R"("position":[1,2,3])") != std::string::npos);
+        VISTA_CHECK(tracked.find(R"("orientation":[0,0,0,1])") != std::string::npos);
+        poses.publish({models::LidarPoseState::last_known, pose, generation});
+        const auto held = receive_text();
+        VISTA_CHECK(held.find(R"("state":"last_known")") != std::string::npos);
+        VISTA_CHECK(held.find(R"("position":[1,2,3])") != std::string::npos);
+        poses.publish({models::LidarPoseState::unavailable, std::nullopt, 8});
+        const auto reset = receive_text();
+        VISTA_CHECK(reset.find(R"("state":"unavailable")") != std::string::npos);
+        VISTA_CHECK(reset.find(R"("mappingGeneration":8)") != std::string::npos);
+        VISTA_CHECK(reset.find(R"("position")") == std::string::npos);
+    }
 }
 
 VISTA_TEST(gaussian_surface_mode_parser_preserves_legacy_and_rejects_invalid_modes) {

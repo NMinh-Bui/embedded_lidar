@@ -15,6 +15,36 @@ namespace vista::application {
 namespace {
 using models::GaussianSurfaceMode;
 
+std::string lidar_pose_message(models::LidarPoseStatus status) {
+    using models::LidarPoseState;
+    const auto finite=[](const auto& values) {
+        return std::all_of(values.begin(),values.end(),[](double value){return std::isfinite(value);});
+    };
+    if (!status.pose || !finite(status.pose->position_m) || !finite(status.pose->orientation_xyzw)) {
+        status.state=LidarPoseState::unavailable;
+        status.pose.reset();
+    }
+    const char* name="unavailable";
+    switch(status.state) {
+        case LidarPoseState::unavailable: break;
+        case LidarPoseState::tracking: name="tracking"; break;
+        case LidarPoseState::fixed_mount: name="fixed_mount"; break;
+        case LidarPoseState::last_known: name="last_known"; break;
+    }
+    std::ostringstream json;
+    json.imbue(std::locale::classic());
+    json.precision(10);
+    json << R"({"type":"lidar-pose","state":")" << name << R"(","mappingGeneration":)" << status.mapping_generation;
+    if(status.pose) {
+        const auto& p=status.pose->position_m;
+        const auto& q=status.pose->orientation_xyzw;
+        json << R"(,"position":[)" << p[0] << ',' << p[1] << ',' << p[2]
+             << R"(],"orientation":[)" << q[0] << ',' << q[1] << ',' << q[2] << ',' << q[3] << ']';
+    }
+    json << '}';
+    return json.str();
+}
+
 std::string mapping_state(const std::shared_ptr<MappingPoseControl>& control) {
     const auto status = control->status();
     const auto& mount = status.active.mount;
@@ -112,12 +142,14 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
     validate_pointcloud_websocket_config(config);
     auto subscriber=bus.subscribe<models::RoomMapViewMessage>(
         config.gaussian_map?models::topics::gaussian_map_view:models::topics::room_map_view,thread.name);
+    auto poses=bus.subscribe<models::LidarPoseStatus>(models::topics::lidar_pose,thread.name);
     return platform::spawn_worker(std::move(thread),[stop,config=std::move(config),
-        subscriber=std::move(subscriber),complete=std::move(complete)]() mutable {
+        subscriber=std::move(subscriber),poses=std::move(poses),complete=std::move(complete)]() mutable {
         try {
             struct ClientView {
                 models::RoomMapViewRequest request;
-                std::string requested_signature,sent_signature,sent_control_state;
+                std::string requested_signature,sent_signature,sent_control_state,sent_pose;
+                bool wants_pose{};
                 std::uint64_t sent_revision{};
                 models::RoomMapState sent_state{models::RoomMapState::empty};
                 bool delivered{};
@@ -129,7 +161,9 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
             std::unique_ptr<transport::WebSocketServer> server;
             std::unordered_map<std::uint64_t,ClientView> views;
             std::shared_ptr<const models::RoomMapViewMessage> latest;
+            std::shared_ptr<const models::LidarPoseStatus> current_pose;
             auto retry=std::chrono::steady_clock::now();
+            auto pose_arrival=retry;
             while(!stop.is_stop_requested()) {
                 std::shared_ptr<const models::RoomMapViewMessage> message;
                 const auto received=subscriber.receive_for(message,std::chrono::milliseconds(25));
@@ -139,6 +173,11 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                     latest=message;++report.received_messages;
                 }
                 const auto now=std::chrono::steady_clock::now();
+                std::shared_ptr<const models::LidarPoseStatus> received_pose;
+                for(unsigned i=0;i<16 && poses.try_receive(received_pose)==platform::ReceiveStatus::message;++i) {
+                    current_pose=std::move(received_pose);
+                    pose_arrival=now;
+                }
                 if(!server && now>=retry) {
                     try {
                         server=std::make_unique<transport::WebSocketServer>(transport::WebSocketServer::listen({
@@ -164,6 +203,10 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                     }
                     for(const auto& incoming:server->poll_text()) {
                         const auto found=views.find(incoming.client_id);if(found==views.end()) continue;
+                        if(incoming.text=="LIDAR POSE") {
+                            found->second.wants_pose=true;
+                            continue;
+                        }
                         if (!config.gaussian_map && incoming.text.rfind("MAPPING ", 0) == 0) {
                             try {
                                 request_mapping_change(incoming.text, config.mapping_control);
@@ -191,6 +234,22 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                             auto& sent = entry.second.sent_control_state;
                             if (sent != control_state && server->send_text(entry.first, control_state))
                                 sent = control_state;
+                        }
+                    }
+                    if(std::any_of(views.begin(),views.end(),[](const auto& entry){return entry.second.wants_pose;})) {
+                        models::LidarPoseStatus pose;
+                        if(config.fixed_lidar_pose)
+                            pose={models::LidarPoseState::fixed_mount,config.fixed_lidar_pose,0};
+                        else if(current_pose) {
+                            pose=*current_pose;
+                            if(pose.pose && now-pose_arrival>std::chrono::seconds(2))
+                                pose.state=models::LidarPoseState::last_known;
+                        }
+                        const auto pose_text=lidar_pose_message(pose);
+                        for(auto& entry:views) {
+                            auto& view=entry.second;
+                            if(view.wants_pose && pose_text!=view.sent_pose && server->send_text(entry.first,pose_text))
+                                view.sent_pose=pose_text;
                         }
                     }
                     if(!latest) continue;
@@ -231,7 +290,8 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                         meta<<"{\"type\":\"roommap\",\"revision\":"<<latest->revision
                             <<",\"totalPoints\":"<<latest->point_count<<",\"pointBudget\":"<<config.maximum_points
                             <<",\"state\":"<<static_cast<unsigned>(state)
-                            <<",\"mappingGeneration\":"<<latest->mapping_generation<<",\"bounds\":[";
+                            <<",\"mappingGeneration\":"<<latest->mapping_generation
+                            <<",\"supportsLidarPose\":true,\"bounds\":[";
                         for(unsigned i=0;i<6;++i) {if(i) meta<<',';meta<<bounds[i];}meta<<"]";
                         if(config.gaussian_map) {
                             meta<<",\"supportsEdges\":true,\"supportsCorners\":true,\"surfaceMode\":\""
