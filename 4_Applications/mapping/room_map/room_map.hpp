@@ -16,6 +16,8 @@
 namespace vista::transport { class RoomMapSessionFile; }
 namespace vista::application {
 
+class MappingPoseControl;
+
 struct RoomMapConfig {
     bool surface_snapshots{false}; // Gaussian OR foreground uses immutable confirmed regions.
     bool enabled{false};
@@ -38,6 +40,7 @@ struct RoomMapConfig {
     std::size_t raycast_maximum_rays_per_window{256};
     float raycast_maximum_range_m{30.0F};
     float raycast_surface_margin_m{0.10F};
+    std::shared_ptr<MappingPoseControl> mapping_control;
 };
 
 /// Rejects unsafe memory limits and invalid timing/voxel settings before startup.

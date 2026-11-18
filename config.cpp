@@ -484,6 +484,10 @@ AppConfig parse_device_config_text(const std::string& contents) {
             config.room_map_websocket.maximum_clients = static_cast<std::size_t>(parse_unsigned(value, "RoomMapWebSocketMaxClients", 64));
         } else if (key == "roommapwebsocketretryintervalseconds") {
             config.room_map_websocket.retry_interval = std::chrono::seconds(parse_unsigned(value, "RoomMapWebSocketRetryIntervalSeconds", maximum_reconnect_interval_seconds));
+        } else if (key == "settingswebsocketbindaddress") {
+            config.settings_bind_address = value;
+        } else if (key == "settingswebsocketport") {
+            config.settings_port = static_cast<std::uint16_t>(parse_unsigned(value, "SettingsWebSocketPort", 65'535));
         } else if (key == "systemmonitorintervalmilliseconds") {
             config.system_monitor.sample_interval = std::chrono::milliseconds(
                 parse_unsigned(
@@ -671,8 +675,7 @@ vista::fs::path data_root_for_executable(const vista::fs::path& executable,
     return build_data_root.lexically_normal();
 }
 
-AppConfig AppConfig::load(const vista::fs::path& path) {
-    const auto session_start = std::chrono::system_clock::now();
+std::string read_device_config_text(const vista::fs::path& path) {
     const auto config_path = vista::fs::absolute(path).lexically_normal();
     vista::io::ifstream input(config_path, std::ios::binary);
     if (!input) {
@@ -688,17 +691,52 @@ AppConfig AppConfig::load(const vista::fs::path& path) {
             config_path.u8string() + "'");
     }
 
+    return contents.str();
+}
+
+std::string overlay_device_config(const std::string& base,
+    const std::map<std::string,std::string>& changes) {
+    const std::map<std::string,std::string> aliases{
+        {"ip","sensorip"}, {"tcpport","sensorport"}, {"port","sensorport"},
+        {"comport","usbserial"}, {"width","depthwidth"}, {"height","depthheight"},
+        {"fps","depthfps"}, {"lidarreconnectintervalseconds","reconnectintervalseconds"}
+    };
+    std::map<std::string,std::string> keys;
+    for (const auto& change : changes) keys.emplace(lower_copy(change.first), change.first);
+    std::istringstream input(base);
+    std::string result, line;
+    while (std::getline(input, line)) {
+        const auto trimmed = trim(line);
+        const auto split = line.find(':');
+        if (trimmed.empty() || trimmed.front() == '#' || split == std::string::npos) {
+            result += line + '\n';
+            continue;
+        }
+        auto key = lower_copy(without_device_note(line.substr(0, split)));
+        if (const auto alias = aliases.find(key); alias != aliases.end()) key = alias->second;
+        if (keys.count(key) == 0) result += line + '\n';
+    }
+    for (const auto& change : changes) result += change.first + ": " + change.second + '\n';
+    return result;
+}
+
+vista::fs::path application_data_root() {
+    return data_root_for_executable(platform::executable_path(), vista::fs::path(VISTA_DATA_ROOT));
+}
+
+AppConfig AppConfig::load(const vista::fs::path& path) {
+    const auto session_start = std::chrono::system_clock::now();
+    const auto config_path = vista::fs::absolute(path).lexically_normal();
+    const auto contents = read_device_config_text(config_path);
     auto config = [&] {
         try {
-            return parse_device_config_text(contents.str());
+            return parse_device_config_text(contents);
         } catch (const std::invalid_argument& error) {
             throw std::invalid_argument("invalid device configuration '" +
                 config_path.u8string() + "': " + error.what());
         }
     }();
-    const auto data_root = data_root_for_executable(
-        platform::executable_path(), vista::fs::path(VISTA_DATA_ROOT));
-    configure_session_output_paths(config, data_root, session_start);
+    configure_session_output_paths(config, application_data_root(), session_start);
     return config;
 }
 

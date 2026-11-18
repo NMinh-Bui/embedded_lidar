@@ -2,8 +2,8 @@
 
 namespace vista::platform {
 
-MessageBus::MessageBus(std::size_t default_capacity)
-    : default_capacity_(default_capacity) {
+MessageBus::MessageBus(std::size_t default_capacity, Lifetime lifetime)
+    : default_capacity_(default_capacity), lifetime_(lifetime) {
     if (default_capacity_ == 0) {
         throw std::invalid_argument(
             "message bus default capacity must be greater than zero");

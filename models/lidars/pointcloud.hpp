@@ -36,6 +36,8 @@ struct PointCloudFrame {
     /// Missing origin disables free-space clearing rather than guessing an origin.
     std::optional<std::array<float, 3>> sensor_origin_world_m;
 
+    std::uint64_t mapping_generation{};
+
     PointCloudFrame() = default;
     PointCloudFrame(std::uint64_t timestamp, std::vector<PointXYZIRT> values,
                     std::optional<std::array<float, 3>> origin = std::nullopt)

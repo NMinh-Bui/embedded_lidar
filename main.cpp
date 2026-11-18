@@ -1,4 +1,399 @@
 #include "lib.hpp"
+#include "4_Applications/mapping/mapping_pose_control.hpp"
+#include "4_Applications/settings/runtime_settings.hpp"
+#include "1_Platform/os/paths.hpp"
+
+#include <map>
+#include <set>
+
+namespace {
+using namespace vista;
+using namespace vista::application;
+using namespace std::chrono_literals;
+
+enum class Task {
+    read, decode, lio, clean, live_clean, room, gaussian, foreground,
+    room_socket, gaussian_socket, foreground_socket, raw_log, pcd_log,
+    grafana, monitor
+};
+
+class CaptureWorkers {
+public:
+    explicit CaptureWorkers(const platform::StopToken& stop) : stop_(stop) {}
+    ~CaptureWorkers() {
+        for (auto& entry : workers_) entry.second.stop.request_local_stop();
+        for (auto& entry : workers_) {
+            try { entry.second.handle.join(); } catch (...) {}
+        }
+    }
+
+    template <typename Report, typename Spawn>
+    void start(Task task, const WorkerConfig& worker, Spawn spawn,
+        std::function<void(const Report&)> on_report = {}) {
+        if (!worker.enabled || workers_.count(task)) return;
+        auto stop = stop_.child();
+        auto result = std::make_shared<platform::WorkerResult<Report>>();
+        std::vector<platform::WorkerHandle> handles;
+        handles.reserve(1);
+        platform::add_worker(handles, spawn(worker.thread,stop,platform::completion_for(result)));
+        workers_.emplace(task, Active{std::move(handles.front()),stop,
+            [worker,result,on_report=std::move(on_report)](std::vector<std::string>& errors) {
+                platform::collect_worker_error(errors,worker.thread.name,result,true);
+                if (on_report && result->report) on_report(*result->report);
+            }});
+    }
+
+    void stop(const std::set<Task>& tasks) {
+        std::vector<std::string> failures;
+        // Stop the reader first. The decoder and loggers can then finish or
+        // release their old subscriptions before new source packets arrive.
+        for (auto task : tasks) {
+            const auto found = workers_.find(task);
+            if (found != workers_.end()) found->second.stop.request_local_stop();
+        }
+        for (auto task : tasks) join(task, failures);
+        platform::throw_if_worker_failures(failures);
+    }
+
+    void join_all() {
+        std::vector<std::string> failures;
+        while (!workers_.empty()) join(workers_.begin()->first, failures);
+        platform::throw_if_worker_failures(failures);
+    }
+
+private:
+    struct Active {
+        platform::WorkerHandle handle;
+        platform::StopToken stop;
+        std::function<void(std::vector<std::string>&)> report;
+    };
+    void join(Task task, std::vector<std::string>& failures) {
+        const auto found = workers_.find(task);
+        if (found == workers_.end()) return;
+        auto& active = found->second;
+        try { active.handle.join(); }
+        catch (const std::exception& error) { failures.push_back(active.handle.name() + ": " + error.what()); }
+        catch (...) { failures.push_back(active.handle.name() + ": unknown worker error"); }
+        active.report(failures);
+        workers_.erase(found);
+    }
+
+    platform::StopToken stop_;
+    std::map<Task,Active> workers_;
+};
+
+std::set<Task> affected_workers(const SettingsRequest& request, const SettingChanges& changes) {
+    const auto changed = [&](const char* field) { return changes.count(field) != 0; };
+    std::set<Task> tasks;
+    const auto reset_map = [&] {
+        tasks.insert({Task::room,Task::room_socket,Task::gaussian,Task::gaussian_socket,
+                      Task::foreground,Task::foreground_socket});
+    };
+    if (request.group == "lidar" && changes.size() == 1 && changed("ReconnectIntervalSeconds"))
+        return tasks;
+    if (request.group == "lidar" || request.group.rfind("lio_",0) == 0) {
+        reset_map();
+        tasks.insert({Task::lio,Task::clean,Task::pcd_log});
+        if (request.group == "lidar")
+            tasks.insert({Task::read,Task::decode,Task::live_clean,Task::raw_log,Task::grafana});
+    } else if (request.group == "logging") {
+        if (changed("RawLoggingEnabled")) tasks.insert(Task::raw_log);
+        if (changed("PointCloudLoggingEnabled")) tasks.insert(Task::pcd_log);
+    } else if (request.group == "telemetry") {
+        if (changed("SystemMonitorIntervalMilliseconds")) tasks.insert(Task::monitor);
+        if (changed("GrafanaRetryIntervalSeconds") || changed("GrafanaPublishIntervalMilliseconds"))
+            tasks.insert(Task::grafana);
+    } else if (request.group == "room_map") {
+        reset_map();
+    } else if (request.group == "room_map_io") {
+        for (const auto& change : changes)
+            if (change.first.rfind("RoomMapWebSocket",0) != 0) reset_map();
+        if (changed("RoomMapWebSocketMaxPoints")) tasks.insert(Task::room_socket);
+        if (changed("RoomMapWebSocketMaxClients") || changed("RoomMapWebSocketRetryIntervalSeconds"))
+            tasks.insert({Task::room_socket,Task::gaussian_socket,Task::foreground_socket});
+    } else if (request.group == "gaussian") {
+        tasks.insert(Task::gaussian_socket);
+        if (changed("GaussianMapEnabled")) tasks.insert(Task::gaussian);
+    } else if (request.group == "foreground") {
+        tasks.insert({Task::foreground,Task::foreground_socket});
+    }
+    return tasks;
+}
+
+vista::fs::path next_capture_file(const vista::fs::path& preferred) {
+    vista::fs::create_directories(preferred.parent_path());
+    for (std::size_t suffix=0;suffix<10'000;++suffix) {
+        const auto path = suffix == 0 ? preferred : preferred.parent_path() /
+            (preferred.stem().native() + vista::fs::path("_" + std::to_string(suffix)).native() +
+             preferred.extension().native());
+        if (platform::create_text_file_if_missing(path, {})) return path;
+    }
+    throw std::runtime_error("No available capture filename");
+}
+
+std::string restart_summary(const std::set<Task>& tasks) {
+    if (tasks.count(Task::read)) return "Applied. LiDAR reconnecting. A new mapping session is starting.";
+    if (tasks.count(Task::lio)) return "Applied. Point-LIO and the mapping session are restarting.";
+    if (tasks.count(Task::room)) return "Applied. Room Map is starting a new session.";
+    return "Applied for this session.";
+}
+
+void run_capture(AppConfig active, std::string device_text) {
+    const auto root = application_data_root();
+    const auto session_start = std::chrono::system_clock::now();
+    auto config = active;
+    configure_session_output_paths(config,root,session_start);
+    auto runtime = config.runtime_config();
+    const auto* token = std::getenv("VISTA_MAPPING_CONTROL_TOKEN");
+    const bool use_control = token && MappingPoseControl::valid_token(token);
+    std::shared_ptr<MappingPoseControl> mapping_control;
+    if (use_control) {
+        mapping_control = std::make_shared<MappingPoseControl>(
+            MappingPose{config.mounting.value_or(MountingConfig{}),config.lio.enabled},token);
+    } else if (token) std::cerr << "Invalid VISTA_MAPPING_CONTROL_TOKEN; remote controls disabled\n";
+
+    platform::StopToken stop;
+    platform::MessageBus bus(16,use_control ? platform::MessageBus::Lifetime::explicit_close :
+        platform::MessageBus::Lifetime::last_publisher);
+        // Main only defines queue capacities. Each worker creates its own
+        // publisher/subscriber endpoints inside its spawn_* function.
+        bus.configure_topic(
+            vista::models::topics::lidar_raw,
+            runtime.queues.raw_capacity);
+        bus.configure_topic(
+            vista::models::topics::lidar_imu,
+            4096); // Bounded ~8 s at 500 Hz, including slow Debug LIO solves.
+        bus.configure_topic(
+            vista::models::topics::pointcloud_decoded,
+            runtime.queues.decoded_capacity);
+        bus.configure_topic(vista::models::topics::pointcloud_cleaned, runtime.queues.processed_capacity);
+        bus.configure_topic(vista::models::topics::pointcloud_cleaned_sensor, runtime.queues.processed_capacity);
+        bus.configure_topic(vista::models::topics::pointcloud_world,4);
+        bus.configure_topic(vista::models::topics::localization_status,runtime.queues.telemetry_capacity);
+        // Map snapshots are much larger than individual sensor packets; retain only two.
+        bus.configure_topic(vista::models::topics::room_map, 2);
+        bus.configure_topic(vista::models::topics::room_map_view, 2);
+        bus.configure_topic(vista::models::topics::gaussian_map_view,2);
+        bus.configure_topic(vista::models::topics::foreground_points,2);
+        bus.configure_topic(vista::models::topics::room_map_status, runtime.queues.telemetry_capacity);
+        bus.configure_topic(
+            vista::models::topics::system_health,
+            runtime.queues.telemetry_capacity);
+        bus.configure_topic(
+            vista::models::topics::worker_health,
+            runtime.queues.telemetry_capacity);
+        bus.configure_topic(
+            vista::models::topics::storage_health,
+            runtime.queues.telemetry_capacity);
+        bus.configure_topic(
+            vista::models::topics::power_thermal,
+            runtime.queues.telemetry_capacity);
+    RuntimeSettings settings(active);
+    std::optional<platform::WorkerHandle> settings_server;
+    std::uint64_t packets{}, points{}, dropped_decode{}, dropped_raw{}, dropped_clean{}, dropped_pcd{};
+    std::optional<RoomMapReport> final_map;
+    std::optional<ForegroundReport> final_foreground;
+    std::optional<GrafanaBridgeReport> final_grafana;
+    const auto capture_started = std::chrono::steady_clock::now();
+    CaptureWorkers workers(stop);
+    auto decoder_slot = std::make_shared<devices::LidarDecoderSlot>();
+    auto lidar_config = config.lidar_config();
+    auto reconnect_interval = std::make_shared<std::atomic<std::chrono::milliseconds::rep>>(
+        config.lidar_reconnect_interval.count());
+
+    // Each factory still declares its own subscriptions. New workers always
+    // subscribe before producers start, and replacements drop old input queues.
+    const auto start_workers = [&] {
+        config.room_map.mapping_control.reset();
+        config.room_map_websocket.mapping_control.reset();
+        const bool has_imu = config.lidar_type == devices::LidarType::unitree_l2;
+        if (mapping_control) {
+            const auto pose = mapping_control->status().active;
+            config.mounting = pose.mount;
+            config.lio.initial_position_m = {pose.mount.mount_x_m,pose.mount.mount_y_m,pose.mount.mount_z_m};
+            config.lio.initial_rpy_deg = {pose.mount.mount_roll_deg,pose.mount.mount_pitch_deg,pose.mount.mount_yaw_deg};
+            config.lio.enabled = has_imu && pose.lio_enabled;
+            // Optional branches can then be toggled without discarding the live map.
+            config.room_map.surface_snapshots = config.room_map.enabled;
+        }
+        runtime = config.runtime_config();
+        if (mapping_control && has_imu) {
+            config.room_map.mapping_control = mapping_control;
+            if (config.grafana.enabled && config.room_map.enabled && !config.room_map.load_existing)
+                config.room_map_websocket.mapping_control = mapping_control;
+            runtime.preprocessing.input_world_coordinates = true;
+            runtime.threads.localization.enabled = true;
+        }
+        config.foreground.require_localization = runtime.threads.localization.enabled;
+        platform::validate_worker_selection(config,runtime);
+
+        const auto& t = runtime.threads;
+        workers.start<ForegroundReport>(Task::foreground,t.foreground_filter,[&](auto thread,auto s,auto done) {
+            return spawn_foreground_worker(bus,thread,s,config.foreground,done);
+        },[&](const auto& report) { final_foreground = report; });
+        workers.start<PointCloudWebSocketReport>(Task::foreground_socket,t.foreground_websocket,[&](auto thread,auto s,auto done) {
+            return spawn_foreground_websocket(bus,thread,s,config.foreground_websocket,done);
+        });
+        workers.start<GrafanaBridgeReport>(Task::grafana,t.grafana_bridge,[&](auto thread,auto s,auto done) {
+            return spawn_grafana_bridge(bus,thread,s,config.grafana,done);
+        },[&](const auto& report) { final_grafana = report; });
+        workers.start<PointCloudWebSocketReport>(Task::room_socket,t.room_map_websocket,[&](auto thread,auto s,auto done) {
+            return spawn_pointcloud_websocket(bus,thread,s,config.room_map_websocket,done);
+        });
+        workers.start<PointCloudWebSocketReport>(Task::gaussian_socket,t.gaussian_map_websocket,[&](auto thread,auto s,auto done) {
+            return spawn_pointcloud_websocket(bus,thread,s,config.gaussian_map_websocket,done);
+        });
+        workers.start<GaussianMapReport>(Task::gaussian,t.gaussian_mapping,[&](auto thread,auto s,auto done) {
+            auto gaussian = config.gaussian_map;
+            if (!config.room_map.storage_directory.empty()) {
+                gaussian.storage_directory = config.room_map.storage_directory;
+                gaussian.storage_directory += ".gaussian";
+            }
+            return spawn_gaussian_map_worker(bus,thread,s,gaussian,done);
+        });
+        workers.start<RoomMapReport>(Task::room,t.room_mapping,[&](auto thread,auto s,auto done) {
+            return spawn_room_map_worker(bus,thread,s,config.room_map,done);
+        },[&](const auto& report) { final_map = report; });
+        workers.start<SystemMonitorReport>(Task::monitor,t.system_monitor,[&](auto thread,auto s,auto done) {
+            return spawn_system_monitor(bus,thread,s,config.system_monitor,done);
+        });
+        workers.start<LoggerReport>(Task::pcd_log,t.pcd_logger,[&](auto thread,auto s,auto done) {
+            return spawn_pcd_logger(bus,thread,s,next_capture_file(*config.pcd_path),done);
+        },[&](const auto& report) { dropped_pcd += report.dropped_message_count; });
+        workers.start<PreprocessingReport>(Task::clean,t.preprocessing,[&](auto thread,auto s,auto done) {
+            return spawn_preprocessing_worker(bus,thread,s,runtime.preprocessing,done);
+        },[&](const auto& report) { points += report.point_count; dropped_clean += report.dropped_message_count; });
+        workers.start<PreprocessingReport>(Task::live_clean,t.live_preprocessing,[&](auto thread,auto s,auto done) {
+            return spawn_live_preprocessing_worker(bus,thread,s,runtime.preprocessing,done);
+        });
+        workers.start<LioReport>(Task::lio,t.localization,[&](auto thread,auto s,auto done) {
+            return spawn_lio_worker(bus,thread,s,config.lio,done,config.room_map.mapping_control);
+        });
+        workers.start<devices::LidarWorkerReport>(Task::decode,t.lidar_decode,[&](auto thread,auto s,auto done) {
+            return devices::spawn_lidar_decode_worker(bus,thread,s,decoder_slot,done);
+        },[&](const auto& report) { dropped_decode += report.dropped_message_count; });
+        workers.start<LoggerReport>(Task::raw_log,t.raw_logger,[&](auto thread,auto s,auto done) {
+            return spawn_raw_logger(bus,thread,s,next_capture_file(*config.raw_path),done);
+        },[&](const auto& report) { dropped_raw += report.dropped_message_count; });
+        workers.start<devices::LidarWorkerReport>(Task::read,t.lidar_read,[&](auto thread,auto s,auto done) {
+            return devices::spawn_lidar_read_worker(bus,thread,s,[source=lidar_config] {
+                return devices::Lidar::connect(source);
+            },config.lidar_reconnect_interval,decoder_slot,done,reconnect_interval);
+        },[&](const auto& report) { packets += report.message_count; });
+    };
+
+    const auto apply_settings = [&] {
+        if (!settings_server) return;
+        const auto request = settings.take();
+        if (!request) return;
+        try {
+            auto candidate = validate_settings_request(device_text,active,*request,root);
+            if (candidate.changes.empty()) {
+                settings.complete(*request,&active,"Values are already active.");
+                return;
+            }
+            const auto affected = affected_workers(*request,candidate.changes);
+            auto next = candidate.config;
+            configure_session_output_paths(next,root,session_start);
+            auto next_source = next.lidar_config();
+            if (next_source.unitree_l2 && lidar_config.unitree_l2) {
+                const auto& old = *lidar_config.unitree_l2;
+                auto& incoming = *next_source.unitree_l2;
+                if (old.work_mode == incoming.work_mode && old.serial_port == incoming.serial_port &&
+                    old.baud_rate == incoming.baud_rate && old.sensor_ip == incoming.sensor_ip &&
+                    old.sensor_port == incoming.sensor_port && old.initialize_on_connect == incoming.initialize_on_connect) {
+                    incoming.initialization_state = old.initialization_state;
+                }
+            }
+            if (mapping_control && !mapping_control->suspend_if_idle())
+                throw std::invalid_argument("A Mount/LIO pose reset is already pending. Apply again when it completes.");
+            struct ResumePose {
+                std::shared_ptr<MappingPoseControl> control;
+                ~ResumePose() { if (control) control->resume(); }
+            } resume{mapping_control};
+
+            const auto previous = config;
+            const auto previous_source = lidar_config;
+            const auto reset_decoder = [&] {
+                if (affected.count(Task::decode)) decoder_slot = std::make_shared<devices::LidarDecoderSlot>();
+            };
+            try {
+                workers.stop(affected);
+                reset_decoder();
+                config = std::move(next);
+                lidar_config = std::move(next_source);
+                start_workers();
+            } catch (...) {
+                workers.stop(affected);
+                reset_decoder();
+                config = previous;
+                lidar_config = previous_source;
+                start_workers();
+                throw;
+            }
+            reconnect_interval->store(config.lidar_reconnect_interval.count());
+            for (const auto& change : candidate.changes)
+                std::cout << settings_change_line(change.first,change.second) + '\n';
+            std::cout << std::flush;
+            active = std::move(candidate.config);
+            device_text = std::move(candidate.text);
+            settings.complete(*request,&active,restart_summary(affected));
+        } catch (const std::exception& error) {
+            settings.complete(*request,nullptr,error.what());
+        }
+    };
+
+    try {
+        start_workers();
+        std::cout << "Mapping pose: " << (config.lio.enabled ? LioEngine::backend_name() : "fixed mount") << '\n';
+        if (config.lio.enabled)
+            std::cout << "LIO time: host monotonic clock; IMU topic: lidar/imu (one active IMU).\n";
+        if (use_control) {
+            const auto& bind = active.settings_bind_address.empty() ? active.room_map_websocket.bind_address :
+                active.settings_bind_address;
+            try {
+                settings_server.emplace(spawn_settings_server(stop,bind,active.settings_port,token,settings));
+            } catch (const std::exception& error) {
+                std::cerr << "Settings WebSocket unavailable: " << error.what() << '\n';
+            }
+        }
+        std::cout << "Capture is running continuously. Press Ctrl+C to stop.\n";
+        platform::wait_for_shutdown_request(stop,apply_settings);
+    } catch (...) {
+        stop.request_stop();
+        bus.close();
+        if (settings_server) settings_server->join();
+        throw;
+    }
+
+    bus.close();
+    if (settings_server) settings_server->join();
+    workers.join_all();
+    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - capture_started);
+    std::cout << "Capture complete: " << packets << " packet(s), " << points << " processed point(s), "
+              << elapsed.count() << " seconds\n";
+    std::cout << "Ring-buffer drops: decoder=" << dropped_decode << ", raw-logger=" << dropped_raw
+              << ", preprocessing=" << dropped_clean << ", pcd-logger=" << dropped_pcd << '\n';
+    if (final_grafana)
+        std::cout << "Grafana Live: published=" << final_grafana->published_measurements
+                  << ", imu-messages=" << final_grafana->received_imu_messages
+                  << ", failed-attempts=" << final_grafana->failed_publish_attempts
+                  << ", input-drops=" << final_grafana->dropped_input_messages << '\n';
+    if (final_map)
+        std::cout << "Room map: " << final_map->map_points << " points, input-drops="
+                  << final_map->dropped_input_messages << '\n';
+    if (final_foreground) {
+        const auto& report = *final_foreground;
+        std::cout << "Foreground scan filter: " << report.isolated_points << " isolated point(s) removed, "
+                  << report.filter_unresolved_points << " unresolved, " << report.filter_distance_checks << " neighbor checks\n";
+        std::cout << "Foreground: " << report.processed_frames << " sampled query frame(s), "
+                  << report.foreground_frames << " nonempty frame(s), " << report.foreground_points
+                  << " points, background=" << report.background_points << ", unresolved=" << report.unknown_points
+                  << ", peak cache=" << report.peak_cache_points << ", query failures=" << report.query_failures
+                  << ", input drops=" << report.dropped_input_messages << '\n';
+    }
+}
+} // namespace
 
 int main() {
     try {
@@ -20,10 +415,10 @@ int main() {
                          "then restart this application. No workers were started.\n";
             return EXIT_SUCCESS;
         }
-        const auto config = vista::AppConfig::load(config_path);
-        const auto runtime = config.runtime_config();
-        vista::platform::validate_worker_selection(config, runtime);
-
+        auto device_text = vista::read_device_config_text(config_path);
+        auto active = vista::parse_device_config_text(device_text);
+        auto config = active;
+        vista::configure_session_output_paths(config,vista::application_data_root(),std::chrono::system_clock::now());
         std::cout << "Device configuration: " << config_path.u8string()
                   << " (selected " << vista::devices::to_string(config.lidar_type)
                   << ")\n";
@@ -117,394 +512,7 @@ int main() {
             std::cout<<"Foreground: live world points outside confirmed RoomMap; not a motion label\n";
         if(config.foreground_websocket.enabled)
             std::cout<<"Foreground WebSocket: ws://"<<config.foreground_websocket.bind_address<<':'<<config.foreground_websocket.port<<'\n';
-
-        const auto started = std::chrono::steady_clock::now();
-        std::cout << "Mapping pose: " << (config.lio.enabled ? vista::application::LioEngine::backend_name() : "fixed mount") << '\n';
-        if(config.lio.enabled)
-            std::cout << "LIO time: host monotonic clock; IMU topic: lidar/imu (one active IMU).\n";
-        vista::platform::StopToken stop;
-        vista::platform::MessageBus bus;
-        auto decoder_slot =
-            std::make_shared<vista::devices::LidarDecoderSlot>();
-        const auto lidar_config = config.lidar_config();
-
-        // Main only defines queue capacities. Each worker creates its own
-        // publisher/subscriber endpoints inside its spawn_* function.
-        bus.configure_topic(
-            vista::models::topics::lidar_raw,
-            runtime.queues.raw_capacity);
-        bus.configure_topic(
-            vista::models::topics::lidar_imu,
-            4096); // Bounded ~8 s at 500 Hz, including slow Debug LIO solves.
-        bus.configure_topic(
-            vista::models::topics::pointcloud_decoded,
-            runtime.queues.decoded_capacity);
-        bus.configure_topic(vista::models::topics::pointcloud_cleaned, runtime.queues.processed_capacity);
-        bus.configure_topic(vista::models::topics::pointcloud_cleaned_sensor, runtime.queues.processed_capacity);
-        bus.configure_topic(vista::models::topics::pointcloud_world,4);
-        bus.configure_topic(vista::models::topics::localization_status,runtime.queues.telemetry_capacity);
-        // Map snapshots are much larger than individual sensor packets; retain only two.
-        bus.configure_topic(vista::models::topics::room_map, 2);
-        bus.configure_topic(vista::models::topics::room_map_view, 2);
-        bus.configure_topic(vista::models::topics::gaussian_map_view,2);
-        bus.configure_topic(vista::models::topics::foreground_points,2);
-        bus.configure_topic(vista::models::topics::room_map_status, runtime.queues.telemetry_capacity);
-        bus.configure_topic(
-            vista::models::topics::system_health,
-            runtime.queues.telemetry_capacity);
-        bus.configure_topic(
-            vista::models::topics::worker_health,
-            runtime.queues.telemetry_capacity);
-        bus.configure_topic(
-            vista::models::topics::storage_health,
-            runtime.queues.telemetry_capacity);
-        bus.configure_topic(
-            vista::models::topics::power_thermal,
-            runtime.queues.telemetry_capacity);
-
-        auto read_result = std::make_shared<
-            vista::platform::WorkerResult<vista::devices::LidarWorkerReport>>();
-        auto decode_result = std::make_shared<
-            vista::platform::WorkerResult<vista::devices::LidarWorkerReport>>();
-        auto raw_logger_result = std::make_shared<
-            vista::platform::WorkerResult<vista::application::LoggerReport>>();
-        auto preprocessing_result = std::make_shared<
-            vista::platform::WorkerResult<
-                vista::application::PreprocessingReport>>();
-        auto pcd_logger_result = std::make_shared<
-            vista::platform::WorkerResult<vista::application::LoggerReport>>();
-        auto grafana_result = std::make_shared<
-            vista::platform::WorkerResult<
-                vista::application::GrafanaBridgeReport>>();
-        auto system_monitor_result = std::make_shared<
-            vista::platform::WorkerResult<
-                vista::application::SystemMonitorReport>>();
-        auto pointcloud_websocket_result = std::make_shared<
-            vista::platform::WorkerResult<
-                vista::application::PointCloudWebSocketReport>>();
-        auto room_map_result = std::make_shared<
-            vista::platform::WorkerResult<vista::application::RoomMapReport>>();
-        auto room_map_websocket_result = std::make_shared<
-            vista::platform::WorkerResult<vista::application::PointCloudWebSocketReport>>();
-
-        std::vector<vista::platform::WorkerHandle> workers;
-        workers.reserve(16);
-        auto foreground_result=std::make_shared<vista::platform::WorkerResult<vista::application::ForegroundReport>>();
-        auto foreground_socket_result=std::make_shared<vista::platform::WorkerResult<vista::application::PointCloudWebSocketReport>>();
-        bool foreground_started=false,foreground_socket_started=false;
-        auto live_result=std::make_shared<vista::platform::WorkerResult<vista::application::PreprocessingReport>>();
-        bool live_started=false;
-        auto lio_result=std::make_shared<vista::platform::WorkerResult<vista::application::LioReport>>();
-        bool lio_started=false;
-        bool read_started = false;
-        bool decode_started = false;
-        bool raw_logger_started = false;
-        bool preprocessing_started = false;
-        bool pcd_logger_started = false;
-        bool grafana_started = false;
-        bool system_monitor_started = false;
-        bool pointcloud_websocket_started = false;
-        bool room_map_started = false;
-        bool room_map_websocket_started = false;
-        auto gaussian_result=std::make_shared<vista::platform::WorkerResult<vista::application::GaussianMapReport>>();
-        auto gaussian_socket_result=std::make_shared<vista::platform::WorkerResult<vista::application::PointCloudWebSocketReport>>();
-        bool gaussian_started=false,gaussian_socket_started=false;
-
-        try {
-            // The user controls worker creation and startup order in main.
-            if(runtime.threads.foreground_websocket.enabled) {
-                vista::platform::add_worker(workers,vista::application::spawn_foreground_websocket(bus,
-                    runtime.threads.foreground_websocket.thread,stop,config.foreground_websocket,
-                    vista::platform::completion_for(foreground_socket_result)));
-                foreground_socket_started=true;
-            }
-            if(runtime.threads.foreground_filter.enabled) {
-                vista::platform::add_worker(workers,vista::application::spawn_foreground_worker(bus,
-                    runtime.threads.foreground_filter.thread,stop,config.foreground,
-                    vista::platform::completion_for(foreground_result)));
-                foreground_started=true;
-            }
-            if (runtime.threads.grafana_bridge.enabled &&
-                config.grafana.enabled) {
-                vista::platform::add_worker(
-                    workers,
-                    vista::application::spawn_grafana_bridge(
-                        bus,
-                        runtime.threads.grafana_bridge.thread,
-                        stop,
-                        config.grafana,
-                        vista::platform::completion_for(grafana_result)));
-                grafana_started = true;
-            }
-
-            if (runtime.threads.pointcloud_websocket.enabled &&
-                config.grafana.enabled) {
-                vista::platform::add_worker(
-                    workers,
-                    vista::application::spawn_pointcloud_websocket(
-                        bus,
-                        runtime.threads.pointcloud_websocket.thread,
-                        stop,
-                        config.pointcloud_websocket,
-                        vista::platform::completion_for(
-                            pointcloud_websocket_result)));
-                pointcloud_websocket_started = true;
-            }
-
-            if (runtime.threads.room_map_websocket.enabled && config.grafana.enabled) {
-                vista::platform::add_worker(workers, vista::application::spawn_pointcloud_websocket(
-                    bus, runtime.threads.room_map_websocket.thread, stop,
-                    config.room_map_websocket, vista::platform::completion_for(room_map_websocket_result)));
-                room_map_websocket_started = true;
-            }
-
-            if(runtime.threads.gaussian_map_websocket.enabled && config.grafana.enabled) {
-                vista::platform::add_worker(workers,vista::application::spawn_pointcloud_websocket(
-                    bus,runtime.threads.gaussian_map_websocket.thread,stop,config.gaussian_map_websocket,
-                    vista::platform::completion_for(gaussian_socket_result)));
-                gaussian_socket_started=true;
-            }
-            if(runtime.threads.gaussian_mapping.enabled) {
-                auto gaussian_config=config.gaussian_map;
-                if(!config.room_map.storage_directory.empty()) {
-                    gaussian_config.storage_directory=config.room_map.storage_directory;
-                    gaussian_config.storage_directory+=".gaussian";
-                }
-                vista::platform::add_worker(workers,vista::application::spawn_gaussian_map_worker(
-                    bus,runtime.threads.gaussian_mapping.thread,stop,gaussian_config,
-                    vista::platform::completion_for(gaussian_result)));
-                gaussian_started=true;
-            }
-            if (runtime.threads.room_mapping.enabled) {
-                vista::platform::add_worker(workers, vista::application::spawn_room_map_worker(
-                    bus, runtime.threads.room_mapping.thread, stop, config.room_map,
-                    vista::platform::completion_for(room_map_result)));
-                room_map_started = true;
-            }
-
-            if (runtime.threads.system_monitor.enabled) {
-                vista::platform::add_worker(
-                    workers,
-                    vista::application::spawn_system_monitor(
-                        bus,
-                        runtime.threads.system_monitor.thread,
-                        stop,
-                        config.system_monitor,
-                        vista::platform::completion_for(system_monitor_result)));
-                system_monitor_started = true;
-            }
-
-            if (runtime.threads.pcd_logger.enabled && config.pcd_path) {
-                vista::platform::add_worker(
-                    workers,
-                    vista::application::spawn_pcd_logger(
-                        bus,
-                        runtime.threads.pcd_logger.thread,
-                        stop,
-                        *config.pcd_path,
-                        vista::platform::completion_for(pcd_logger_result)));
-                pcd_logger_started = true;
-            }
-
-            if (runtime.threads.preprocessing.enabled) {
-                vista::platform::add_worker(
-                    workers,
-                    vista::application::spawn_preprocessing_worker(
-                        bus,
-                        runtime.threads.preprocessing.thread,
-                        stop,
-                        runtime.preprocessing,
-                        vista::platform::completion_for(preprocessing_result)));
-                preprocessing_started = true;
-            }
-
-            if(runtime.threads.live_preprocessing.enabled) {
-                vista::platform::add_worker(workers,vista::application::spawn_live_preprocessing_worker(
-                    bus,runtime.threads.live_preprocessing.thread,stop,runtime.preprocessing,
-                    vista::platform::completion_for(live_result)));
-                live_started=true;
-            }
-            if(runtime.threads.localization.enabled) {
-                vista::platform::add_worker(workers,vista::application::spawn_lio_worker(
-                    bus,runtime.threads.localization.thread,stop,config.lio,vista::platform::completion_for(lio_result)));
-                lio_started=true;
-            }
-            if (runtime.threads.lidar_decode.enabled) {
-                vista::platform::add_worker(
-                    workers,
-                    vista::devices::spawn_lidar_decode_worker(
-                        bus,
-                        runtime.threads.lidar_decode.thread,
-                        stop,
-                        decoder_slot,
-                        vista::platform::completion_for(decode_result)));
-                decode_started = true;
-            }
-
-            if (runtime.threads.raw_logger.enabled && config.raw_path) {
-                vista::platform::add_worker(
-                    workers,
-                    vista::application::spawn_raw_logger(
-                        bus,
-                        runtime.threads.raw_logger.thread,
-                        stop,
-                        *config.raw_path,
-                        vista::platform::completion_for(raw_logger_result)));
-                raw_logger_started = true;
-            }
-
-            if (runtime.threads.lidar_read.enabled) {
-                vista::platform::add_worker(
-                    workers,
-                    vista::devices::spawn_lidar_read_worker(
-                        bus,
-                        runtime.threads.lidar_read.thread,
-                        stop,
-                        [lidar_config]() {
-                            return vista::devices::Lidar::connect(lidar_config);
-                        },
-                        config.lidar_reconnect_interval,
-                        decoder_slot,
-                        vista::platform::completion_for(read_result)));
-                read_started = true;
-            }
-        } catch (...) {
-            vista::platform::stop_and_join_noexcept(workers, stop, bus);
-            throw;
-        }
-
-        std::cout << "Capture is running continuously. Press Ctrl+C to stop.\n";
-        try {
-            vista::platform::wait_for_shutdown_request(stop);
-        } catch (...) {
-            vista::platform::stop_and_join_noexcept(workers, stop, bus);
-            throw;
-        }
-
-        // Closing the bus wakes subscribers so they can drain queued messages,
-        // finish their files, and exit cleanly.
-        stop.request_stop();
-        bus.close();
-
-        std::vector<std::string> failures;
-        vista::platform::join_workers(workers, stop, bus, failures);
-
-        vista::platform::collect_worker_error(
-            failures,
-            runtime.threads.lidar_read.thread.name,
-            read_result,
-            read_started);
-        vista::platform::collect_worker_error(
-            failures,
-            runtime.threads.lidar_decode.thread.name,
-            decode_result,
-            decode_started);
-        vista::platform::collect_worker_error(
-            failures,
-            runtime.threads.raw_logger.thread.name,
-            raw_logger_result,
-            raw_logger_started);
-        vista::platform::collect_worker_error(
-            failures,
-            runtime.threads.preprocessing.thread.name,
-            preprocessing_result,
-            preprocessing_started);
-        vista::platform::collect_worker_error(
-            failures,
-            runtime.threads.pcd_logger.thread.name,
-            pcd_logger_result,
-            pcd_logger_started);
-        vista::platform::collect_worker_error(
-            failures,
-            runtime.threads.grafana_bridge.thread.name,
-            grafana_result,
-            grafana_started);
-        vista::platform::collect_worker_error(
-            failures,
-            runtime.threads.system_monitor.thread.name,
-            system_monitor_result,
-            system_monitor_started);
-        vista::platform::collect_worker_error(
-            failures,
-            runtime.threads.pointcloud_websocket.thread.name,
-            pointcloud_websocket_result,
-            pointcloud_websocket_started);
-        vista::platform::collect_worker_error(failures, runtime.threads.room_mapping.thread.name,
-                                             room_map_result, room_map_started);
-        vista::platform::collect_worker_error(failures, runtime.threads.room_map_websocket.thread.name,
-                                             room_map_websocket_result, room_map_websocket_started);
-        vista::platform::collect_worker_error(failures,runtime.threads.localization.thread.name,lio_result,lio_started);
-        vista::platform::collect_worker_error(failures,runtime.threads.live_preprocessing.thread.name,live_result,live_started);
-        vista::platform::collect_worker_error(failures,runtime.threads.gaussian_mapping.thread.name,gaussian_result,gaussian_started);
-        vista::platform::collect_worker_error(failures,runtime.threads.gaussian_map_websocket.thread.name,gaussian_socket_result,gaussian_socket_started);
-        vista::platform::collect_worker_error(failures,runtime.threads.foreground_filter.thread.name,foreground_result,foreground_started);
-        vista::platform::collect_worker_error(failures,runtime.threads.foreground_websocket.thread.name,foreground_socket_result,foreground_socket_started);
-        vista::platform::throw_if_worker_failures(failures);
-
-        const auto packet_count =
-            read_result->report ? read_result->report->message_count : 0;
-        const auto point_count = preprocessing_result->report
-                                     ? preprocessing_result->report->point_count
-                                     : 0;
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - started);
-
-        std::cout << "Capture complete: " << packet_count << " packet(s), "
-                  << point_count << " processed point(s), "
-                  << static_cast<double>(elapsed.count()) / 1000.0
-                  << " seconds\n";
-        std::cout << "Ring-buffer drops: decoder="
-                  << (decode_result->report
-                          ? decode_result->report->dropped_message_count
-                          : 0)
-                  << ", raw-logger="
-                  << (raw_logger_result->report
-                          ? raw_logger_result->report->dropped_message_count
-                          : 0)
-                  << ", preprocessing="
-                  << (preprocessing_result->report
-                          ? preprocessing_result->report->dropped_message_count
-                          : 0)
-                  << ", pcd-logger="
-                  << (pcd_logger_result->report
-                          ? pcd_logger_result->report->dropped_message_count
-                          : 0)
-                  << '\n';
-        if (grafana_result->report) {
-            std::cout << "Grafana Live: published="
-                      << grafana_result->report->published_measurements
-                      << ", imu-messages="
-                      << grafana_result->report->received_imu_messages
-                      << ", failed-attempts="
-                      << grafana_result->report->failed_publish_attempts
-                      << ", input-drops="
-                      << grafana_result->report->dropped_input_messages << '\n';
-        }
-        if (pointcloud_websocket_result->report) {
-            std::cout
-                << "Point-cloud WebSocket: frames="
-                << pointcloud_websocket_result->report->broadcast_frames
-                << ", client-deliveries="
-                << pointcloud_websocket_result->report->client_deliveries
-                << ", input-drops="
-                << pointcloud_websocket_result->report->dropped_input_messages
-                << ", server-failures="
-                << pointcloud_websocket_result->report->server_failures
-                << '\n';
-        }
-        if (room_map_result->report) {
-            std::cout << "Room map: " << room_map_result->report->map_points << " points, input-drops="
-                      << room_map_result->report->dropped_input_messages << '\n';
-        }
-        if(foreground_result->report) {
-            const auto& report=*foreground_result->report;
-            std::cout<<"Foreground scan filter: "<<report.isolated_points<<" isolated point(s) removed, "
-                <<report.filter_unresolved_points<<" unresolved, "<<report.filter_distance_checks<<" neighbor checks\n";
-            std::cout<<"Foreground: "<<report.processed_frames<<" sampled query frame(s), "<<report.foreground_frames<<" nonempty frame(s), "<<report.foreground_points
-                <<" points, background="<<report.background_points<<", unresolved="<<report.unknown_points
-                <<", peak cache="<<report.peak_cache_points<<", query failures="<<report.query_failures
-                <<", input drops="<<report.dropped_input_messages<<'\n';
-        }
+        run_capture(std::move(active),std::move(device_text));
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n';

@@ -120,8 +120,8 @@ struct SubscriberState {
 
 template <typename T>
 struct TopicState {
-    explicit TopicState(std::size_t ring_capacity)
-        : capacity(ring_capacity), ring(ring_capacity) {}
+    explicit TopicState(std::size_t ring_capacity, bool close_after_last_publisher)
+        : capacity(ring_capacity), ring(ring_capacity), close_when_idle(close_after_last_publisher) {}
 
     std::size_t oldest_index() const noexcept {
         return retained_count < capacity ? 0 : write_index;
@@ -135,6 +135,7 @@ struct TopicState {
     std::mutex mutex;
     std::vector<std::weak_ptr<SubscriberState<T>>> subscribers;
     std::size_t publisher_count{};
+    const bool close_when_idle;
     bool closed{false};
 };
 
@@ -165,10 +166,10 @@ void close_topic(const std::shared_ptr<TopicState<T>>& state) noexcept {
 template <typename T>
 class Topic {
 public:
-    Topic(std::string name, std::size_t capacity)
+    Topic(std::string name, std::size_t capacity, bool close_when_idle = true)
         : name_(std::move(name)) {
         detail::validate_topic_capacity(capacity);
-        state_ = std::make_shared<detail::TopicState<T>>(capacity);
+        state_ = std::make_shared<detail::TopicState<T>>(capacity,close_when_idle);
     }
 
     TopicPublisher<T> publisher() const {
@@ -346,7 +347,7 @@ private:
             std::lock_guard lock(state_->mutex);
             if (state_->publisher_count > 0) {
                 --state_->publisher_count;
-                if (state_->publisher_count == 0 && !state_->closed) {
+                if (state_->publisher_count == 0 && state_->close_when_idle && !state_->closed) {
                     state_->closed = true;
                     for (auto iterator = state_->subscribers.begin();
                          iterator != state_->subscribers.end();) {

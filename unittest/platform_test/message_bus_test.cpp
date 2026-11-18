@@ -38,6 +38,24 @@ VISTA_TEST(message_bus_late_subscriber_observes_closed_topic) {
         subscriber.receive(message) == vista::platform::ReceiveStatus::closed);
 }
 
+VISTA_TEST(message_bus_explicit_close_keeps_subscribers_alive_across_worker_replacement) {
+    using namespace vista::platform;
+    MessageBus bus(4,MessageBus::Lifetime::explicit_close);
+    auto input=bus.subscribe<int>("test/rotating","reader");
+    std::shared_ptr<const int> message;
+    {
+        auto first=bus.publisher<int>("test/rotating");
+        first.publish(1);
+        VISTA_CHECK(input.try_receive(message)==ReceiveStatus::message && *message==1);
+    }
+    VISTA_CHECK(input.try_receive(message)==ReceiveStatus::timeout);
+    auto replacement=bus.publisher<int>("test/rotating");
+    replacement.publish(2);
+    VISTA_CHECK(input.try_receive(message)==ReceiveStatus::message && *message==2);
+    bus.close();
+    VISTA_CHECK(input.try_receive(message)==ReceiveStatus::closed);
+}
+
 VISTA_TEST(message_bus_worker_inputs_share_one_wait_set_and_assign_bits) {
     vista::platform::MessageBus bus;
     vista::platform::WorkerTopicInputs inputs("multi-input-worker");

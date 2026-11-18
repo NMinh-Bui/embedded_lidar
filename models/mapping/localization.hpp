@@ -6,7 +6,8 @@
 namespace vista::models {
 enum class LocalizationState : std::uint8_t {
     waiting_imu, initializing, tracking, degraded, lost,
-    holding // Last accepted pose only; unobservable current pose, never map-valid.
+    holding, // Last accepted pose only; unobservable current pose, never map-valid.
+    fixed_mount
 };
 struct LocalizationStatus {
     std::uint64_t timestamp_ns{}; // Host calendar time for monitoring; never used to propagate pose.
@@ -17,5 +18,6 @@ struct LocalizationStatus {
     std::uint64_t local_map_points{}, rejected_scans{}, dropped_messages{};
     bool pose_valid{};
     std::string reason;
+    std::uint64_t mapping_generation{};
 };
 } // namespace vista::models

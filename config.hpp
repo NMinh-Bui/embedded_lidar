@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include "1_Platform/compat/filesystem.hpp"
+#include <map>
 #include <optional>
 #include <string>
 
@@ -110,6 +111,9 @@ struct AppConfig {
     application::GaussianMapConfig gaussian_map;
     application::LioConfig lio;
     application::ForegroundConfig foreground;
+    // The dedicated configuration listener remains available independently of the map streams.
+    std::string settings_bind_address;
+    std::uint16_t settings_port{8769};
     application::PointCloudWebSocketConfig foreground_websocket = [] {
         application::PointCloudWebSocketConfig value;
         value.port=8768;value.maximum_points=12'000;value.include_ground_status=false;
@@ -151,6 +155,10 @@ struct AppConfig {
 
 // Public for focused unit tests; normal application code should call AppConfig::load.
 AppConfig parse_device_config_text(const std::string& contents);
+std::string read_device_config_text(const vista::fs::path& path);
+std::string overlay_device_config(const std::string& base,
+    const std::map<std::string,std::string>& changes);
+vista::fs::path application_data_root();
 std::string format_log_timestamp(
     std::chrono::system_clock::time_point timestamp);
 /// Uses ONE session timestamp for RAW, processed PCD, and the new room-map name.

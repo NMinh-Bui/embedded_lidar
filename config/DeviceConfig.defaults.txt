@@ -89,6 +89,10 @@ GrafanaPublishIntervalMilliseconds: 2000
 GrafanaRetryIntervalSeconds: 5
 SystemMonitorIntervalMilliseconds: 2000
 
+# Remote settings use VISTA_MAPPING_CONTROL_TOKEN. Blank inherits the Room Map bind address.
+SettingsWebSocketBindAddress:
+SettingsWebSocketPort: 8769
+
 # Live sensor 3D publishing is disabled; LiDAR/IMU health remains available.
 
 # Room map keeps the floor; freeze after active acquisition seconds (0 = continuous)

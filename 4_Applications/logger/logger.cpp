@@ -25,11 +25,14 @@ std::string current_exception_message() {
 
 LoggerReport run_raw_logger(
     platform::TopicSubscriber<devices::LidarRawMessage> subscriber,
-    const vista::fs::path& path) {
+    const vista::fs::path& path, const platform::StopToken& stop) {
     transport::RawCaptureWriter writer(path);
     LoggerReport report;
     std::shared_ptr<const devices::LidarRawMessage> message;
-    while (subscriber.receive(message) == platform::ReceiveStatus::message) {
+    while (!stop.local_stop_requested()) {
+        const auto received = subscriber.receive_for(message, std::chrono::milliseconds(100));
+        if (received == platform::ReceiveStatus::closed) break;
+        if (received != platform::ReceiveStatus::message) continue;
         writer.write_bytes(message->payload.bytes());
         platform::record_raw_write(message->payload.size());
         ++report.message_count;
@@ -41,11 +44,14 @@ LoggerReport run_raw_logger(
 
 LoggerReport run_pcd_logger(
     platform::TopicSubscriber<devices::LidarPointCloudMessage> subscriber,
-    const vista::fs::path& path) {
+    const vista::fs::path& path, const platform::StopToken& stop) {
     transport::PcdWriter writer(path);
     LoggerReport report;
     std::shared_ptr<const devices::LidarPointCloudMessage> message;
-    while (subscriber.receive(message) == platform::ReceiveStatus::message) {
+    while (!stop.local_stop_requested()) {
+        const auto received = subscriber.receive_for(message, std::chrono::milliseconds(100));
+        if (received == platform::ReceiveStatus::closed) break;
+        if (received != platform::ReceiveStatus::message) continue;
         writer.write_frame(message->payload);
         platform::record_pcd_write(message->payload.points.size());
         ++report.message_count;
@@ -77,7 +83,7 @@ platform::WorkerHandle spawn_raw_logger(
          path = std::move(path),
          on_complete = std::move(on_complete)]() mutable {
             try {
-                on_complete(run_raw_logger(std::move(subscriber), path), {});
+                on_complete(run_raw_logger(std::move(subscriber), path, stop), {});
             } catch (...) {
                 platform::record_storage_write_error();
                 stop.request_stop();
@@ -104,7 +110,7 @@ platform::WorkerHandle spawn_pcd_logger(
          path = std::move(path),
          on_complete = std::move(on_complete)]() mutable {
             try {
-                on_complete(run_pcd_logger(std::move(subscriber), path), {});
+                on_complete(run_pcd_logger(std::move(subscriber), path, stop), {});
             } catch (...) {
                 platform::record_storage_write_error();
                 stop.request_stop();

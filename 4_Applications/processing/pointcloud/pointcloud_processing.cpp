@@ -234,7 +234,23 @@ std::string current_exception_message() {
     try { throw; } catch (const std::exception& error) { return error.what(); } catch (...) { return "unknown preprocessing failure"; }
 }
 
+void transform_points(models::PointCloudFrame& frame, const MountingConfig& mount,
+                      const Matrix3& rotation) {
+    for (auto& point : frame.points) {
+        const auto world = multiply(rotation, Vec3{point.x, point.y, point.z});
+        point.x = world.x + mount.mount_x_m;
+        point.y = world.y + mount.mount_y_m;
+        point.z = world.z + mount.mount_z_m;
+    }
+}
+
 }  // namespace
+
+void apply_fixed_mount(models::PointCloudFrame& frame, const MountingConfig& mount) {
+    transform_points(frame, mount, euler_rotation(mount.mount_roll_deg, mount.mount_pitch_deg,
+                                                  mount.mount_yaw_deg));
+    frame.sensor_origin_world_m = std::array<float, 3>{mount.mount_x_m, mount.mount_y_m, mount.mount_z_m};
+}
 
 const char* to_string(GroundMode mode) noexcept {
     switch (mode) { case GroundMode::static_height:return "static"; case GroundMode::ransac:return "ransac"; case GroundMode::hybrid:return "hybrid"; }
@@ -342,11 +358,7 @@ private:
         return euler_rotation(ground.mount_roll_deg,ground.mount_pitch_deg,ground.mount_yaw_deg);
     }
     void transform_to_world(models::PointCloudFrame& frame,const MountingConfig& ground) const {
-        const auto rotation=current_rotation(ground);
-        for (auto& point:frame.points) {
-            const auto world=multiply(rotation,Vec3{point.x,point.y,point.z});
-            point.x=world.x+ground.mount_x_m; point.y=world.y+ground.mount_y_m; point.z=world.z+ground.mount_z_m;
-        }
+        transform_points(frame, ground, current_rotation(ground));
     }
     void calibrate_if_needed(const std::vector<models::PointXYZIRT>& points,const GroundRemovalConfig& ground) {
         if (ground.mode==GroundMode::static_height || calibration_finished) return;
@@ -457,11 +469,11 @@ platform::WorkerHandle spawn_processing_stage(platform::MessageBus& bus,platform
     return platform::spawn_worker(std::move(thread_config),[stop,inputs=std::move(inputs),pointcloud_input=std::move(pointcloud_input),publisher=std::move(publisher),config=std::move(config),on_complete=std::move(on_complete)]() mutable {
         try {
             PreprocessingReport report; PointCloudPreprocessor processor(std::move(config)); bool pointcloud_closed=false;
-            while (!pointcloud_closed) {
-                const auto ready=inputs.wait();
+            while (!pointcloud_closed && !stop.local_stop_requested()) {
+                const auto ready=inputs.wait_for(std::chrono::milliseconds(100));
                 if (pointcloud_input.is_ready(ready)) {
                     std::shared_ptr<const devices::LidarPointCloudMessage> message;
-                    while (true) {
+                    while (!stop.local_stop_requested()) {
                         const auto status=pointcloud_input.try_receive(message);
                         if (status==platform::ReceiveStatus::closed) { pointcloud_closed=true; break; }
                         if (status!=platform::ReceiveStatus::message) break;

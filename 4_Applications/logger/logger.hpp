@@ -38,10 +38,10 @@ platform::WorkerHandle spawn_pcd_logger(
 
 LoggerReport run_raw_logger(
     platform::TopicSubscriber<devices::LidarRawMessage> subscriber,
-    const vista::fs::path& path);
+    const vista::fs::path& path, const platform::StopToken& stop = {});
 
 LoggerReport run_pcd_logger(
     platform::TopicSubscriber<devices::LidarPointCloudMessage> subscriber,
-    const vista::fs::path& path);
+    const vista::fs::path& path, const platform::StopToken& stop = {});
 
 }  // namespace vista::application

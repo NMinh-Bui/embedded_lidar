@@ -102,6 +102,8 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+void apply_fixed_mount(models::PointCloudFrame& frame, const MountingConfig& mount);
+
 models::PointCloudFrame preprocess_point_cloud(
     models::PointCloudFrame frame,
     const PreprocessingConfig& config);

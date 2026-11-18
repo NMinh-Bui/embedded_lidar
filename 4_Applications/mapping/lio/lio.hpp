@@ -107,10 +107,12 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+class MappingPoseControl;
+
 struct LioReport { std::uint64_t received{}, published{}, rejected{}, dropped{}, duplicate_imu_samples{}; };
 using LioCompletion = std::function<void(std::optional<LioReport>, std::string)>;
 platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
     platform::ThreadConfig thread, platform::StopToken stop, LioConfig config,
-    LioCompletion on_complete);
+    LioCompletion on_complete, std::shared_ptr<MappingPoseControl> mapping_control = {});
 
 } // namespace vista::application

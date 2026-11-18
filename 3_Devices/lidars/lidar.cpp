@@ -63,7 +63,8 @@ LidarWorkerReport run_lidar_reader(
     platform::TopicPublisher<LidarRawMessage> publisher,
     std::chrono::milliseconds reconnect_interval,
     const std::shared_ptr<LidarDecoderSlot>& decoder_slot,
-    const platform::StopToken& stop) {
+    const platform::StopToken& stop,
+    const std::shared_ptr<const std::atomic<std::chrono::milliseconds::rep>>& live_reconnect_interval) {
     LidarWorkerReport report;
 
     while (!stop.is_stop_requested()) {
@@ -113,10 +114,12 @@ LidarWorkerReport run_lidar_reader(
         }
 
         if (!stop.is_stop_requested()) {
+            const auto delay = live_reconnect_interval ? std::chrono::milliseconds(live_reconnect_interval->load()) :
+                reconnect_interval;
             std::cerr << "Retrying LiDAR connection in "
-                      << static_cast<double>(reconnect_interval.count()) / 1000.0
+                      << static_cast<double>(delay.count()) / 1000.0
                       << " second(s).\n";
-            wait_before_reconnect(reconnect_interval, stop);
+            wait_before_reconnect(delay, stop);
         }
     }
     return report;
@@ -126,11 +129,14 @@ LidarWorkerReport run_lidar_decoder(
     const std::shared_ptr<LidarDecoderSlot>& decoder_slot,
     platform::TopicSubscriber<LidarRawMessage> subscriber,
     platform::TopicPublisher<LidarPointCloudMessage> pointcloud_publisher,
-    platform::TopicPublisher<models::ImuMessage> imu_publisher) {
+    platform::TopicPublisher<models::ImuMessage> imu_publisher, const platform::StopToken& stop) {
     LidarWorkerReport report;
     platform::MeasurementClock measurement_clock;
     std::shared_ptr<const LidarRawMessage> message;
-    while (subscriber.receive(message) == platform::ReceiveStatus::message) {
+    while (!stop.local_stop_requested()) {
+        const auto received = subscriber.receive_for(message, std::chrono::milliseconds(100));
+        if (received == platform::ReceiveStatus::closed) break;
+        if (received != platform::ReceiveStatus::message) continue;
         auto imu = decoder_slot->decode_imu_packet(message->payload);
         const auto previous_epoch = measurement_clock.epoch();
         // Inspect every timestamped RAW packet, BEFORE adding another scan row.
@@ -356,7 +362,8 @@ platform::WorkerHandle spawn_lidar_read_worker(
     LidarConnector connect_lidar,
     std::chrono::milliseconds reconnect_interval,
     std::shared_ptr<LidarDecoderSlot> decoder_slot,
-    LidarCompletion on_complete) {
+    LidarCompletion on_complete,
+    std::shared_ptr<const std::atomic<std::chrono::milliseconds::rep>> live_reconnect_interval) {
     if (!connect_lidar || !decoder_slot || reconnect_interval.count() <= 0) {
         throw std::invalid_argument("invalid reconnecting LiDAR worker configuration");
     }
@@ -369,6 +376,7 @@ platform::WorkerHandle spawn_lidar_read_worker(
          connect_lidar = std::move(connect_lidar),
          publisher = std::move(publisher),
          reconnect_interval,
+         live_reconnect_interval = std::move(live_reconnect_interval),
          decoder_slot = std::move(decoder_slot),
          on_complete = std::move(on_complete)]() mutable {
             try {
@@ -377,7 +385,7 @@ platform::WorkerHandle spawn_lidar_read_worker(
                     std::move(publisher),
                     reconnect_interval,
                     decoder_slot,
-                    stop);
+                    stop,live_reconnect_interval);
                 on_complete(report, {});
             } catch (...) {
                 stop.request_stop();
@@ -417,7 +425,7 @@ platform::WorkerHandle spawn_lidar_decode_worker(
                     decoder_slot,
                     std::move(subscriber),
                     std::move(pointcloud_publisher),
-                    std::move(imu_publisher));
+                    std::move(imu_publisher), stop);
                 on_complete(report, {});
             } catch (...) {
                 stop.request_stop();

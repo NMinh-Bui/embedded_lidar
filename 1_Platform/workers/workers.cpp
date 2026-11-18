@@ -89,7 +89,7 @@ void add_worker(
     workers.push_back(std::move(handle));
 }
 
-void wait_for_shutdown_request(const StopToken& stop) {
+void wait_for_shutdown_request(const StopToken& stop, const std::function<void()>& tick) {
     shutdown_signal_received = 0;
     const auto previous_interrupt = std::signal(SIGINT, record_shutdown_signal);
     const auto previous_terminate = std::signal(SIGTERM, record_shutdown_signal);
@@ -97,12 +97,18 @@ void wait_for_shutdown_request(const StopToken& stop) {
         throw std::runtime_error("could not install shutdown signal handlers");
     }
 
+    struct RestoreSignals {
+        decltype(previous_interrupt) interrupt, terminate;
+        ~RestoreSignals() {
+            std::signal(SIGINT, interrupt);
+            std::signal(SIGTERM, terminate);
+        }
+    } restore{previous_interrupt, previous_terminate};
+
     while (!stop.is_stop_requested() && shutdown_signal_received == 0) {
+        if (tick) tick();
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-
-    std::signal(SIGINT, previous_interrupt);
-    std::signal(SIGTERM, previous_terminate);
     stop.request_stop();
 }
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -43,7 +44,7 @@ void add_worker(
     WorkerHandle handle);
 
 /// Blocks until Ctrl+C/SIGTERM or a worker requests cooperative shutdown.
-void wait_for_shutdown_request(const StopToken& stop);
+void wait_for_shutdown_request(const StopToken& stop, const std::function<void()>& tick = {});
 
 /// Requests shutdown, closes all topics, and joins without hiding a startup error.
 void stop_and_join_noexcept(

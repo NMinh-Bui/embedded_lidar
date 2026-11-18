@@ -332,13 +332,15 @@ platform::WorkerHandle spawn_foreground_worker(platform::MessageBus& bus,platfor
                 }
                 const bool due=now_tp>=next_sample;
                 if(due) {next_sample=now_tp+config.publish_interval;prefetch_tokens=4;} // No catch-up bursts after slow queries.
-                const bool valid_pose=!config.require_localization || (pose && now-pose_arrival<pose_heartbeat_stale_ns &&
-                    pose->pose_valid && pose->state==models::LocalizationState::tracking &&
+                const bool trusted_pose = pose && (pose->state == models::LocalizationState::tracking ||
+                    pose->state == models::LocalizationState::fixed_mount);
+                const bool valid_pose=!config.require_localization || (trusted_pose && now-pose_arrival<pose_heartbeat_stale_ns &&
+                    pose->pose_valid &&
                     std::isfinite(pose->position_variance) && pose->position_variance<0.01);
                 const auto pose_problem=[&]() -> std::string {
                     if(!pose) return "waiting for localization status";
                     if(now-pose_arrival>=pose_heartbeat_stale_ns) return "localization status older than 2.5 seconds";
-                    if(!pose->pose_valid || pose->state!=models::LocalizationState::tracking)
+                    if(!pose->pose_valid || !trusted_pose)
                         return "localization unavailable: "+pose->reason;
                     return "localization position variance must be below 0.01 m2";
                 };
@@ -348,6 +350,11 @@ platform::WorkerHandle spawn_foreground_worker(platform::MessageBus& bus,platfor
                 if(!background || !background->source || background->state==models::RoomMapState::load_error ||
                    background->state==models::RoomMapState::storage_error || background->state==models::RoomMapState::disabled) {
                     pause("confirmed background unavailable");continue;
+                }
+                if (background->mapping_generation != latest->payload.mapping_generation ||
+                    (config.require_localization && pose->mapping_generation != latest->payload.mapping_generation)) {
+                    pause("waiting for a scan and background in the new Mount frame");
+                    continue;
                 }
                 if(have_sample && latest->lidar_id==last_source && latest->sequence==last_sequence &&
                    latest->measurement_clock_epoch==last_epoch && latest->received_monotonic_ns==last_receipt) continue;

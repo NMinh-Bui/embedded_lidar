@@ -112,6 +112,7 @@ struct RoomMapViewMessage {
     // Host steady-clock completion of this checkpoint, unchanged by heartbeats.
     // A newer scan receipt is required before foreground may subtract it.
     std::uint64_t checkpoint_monotonic_ns{};
+    std::uint64_t mapping_generation{};
 };
 
 }  // namespace vista::models

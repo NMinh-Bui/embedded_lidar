@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -15,6 +16,8 @@
 #include "models/mapping/room_map.hpp"
 
 namespace vista::application {
+
+class MappingPoseControl;
 
 struct PointCloudWebSocketConfig {
     bool enabled{false};
@@ -30,6 +33,7 @@ struct PointCloudWebSocketConfig {
     bool room_map_lod{false};
     bool include_ground_status{true};
     bool gaussian_map{false};
+    std::shared_ptr<MappingPoseControl> mapping_control;
 };
 
 void validate_pointcloud_websocket_config(

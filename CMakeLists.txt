@@ -71,6 +71,7 @@ function(vista_enable_warnings target_name)
 endfunction()
 
 set(VISTA_CORE_SOURCES
+    4_Applications/settings/runtime_settings.cpp
     config.cpp
     1_Platform/compat/filesystem.cpp
     1_Platform/metrics/runtime_metrics.cpp

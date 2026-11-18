@@ -19,6 +19,13 @@
 #include "4_Applications/mapping/room_map/room_map.hpp"
 #include "4_Applications/pointcloud_websocket/pointcloud_websocket.hpp"
 #include "models/topics.hpp"
+#include "1_Platform/timing/measurement_clock.hpp"
+#include "2_Transport/storage/room_map_storage.hpp"
+#include "4_Applications/mapping/lio/lio.hpp"
+#include "4_Applications/mapping/mapping_pose_control.hpp"
+#include "4_Applications/settings/runtime_settings.hpp"
+#include "4_Applications/processing/pointcloud/pointcloud_processing.hpp"
+#include <cmath>
 #include "unittest/test.hpp"
 #include "4_Applications/mapping/gaussian_map/gaussian_map.hpp"
 #include "4_Applications/perception/foreground/foreground.hpp"
@@ -205,6 +212,221 @@ VISTA_TEST(room_map_websocket_replays_to_late_client_and_serves_camera_view) {
     const auto view=client.read_frame();VISTA_CHECK(view.first==2 && view.second.size()==48);
     float x{};std::memcpy(&x,view.second.data()+32,4);VISTA_CHECK(x>0);
     stop.request_stop();bus.close();worker.join();VISTA_CHECK(failure.empty());
+}
+
+VISTA_TEST(room_map_controls_reset_fixed_mount_and_keep_previous_pcd_separate) {
+    using namespace vista;
+    using namespace vista::application;
+    Runtime runtime;
+    platform::MessageBus bus;
+    platform::StopToken stop;
+    const std::string token = "test_only_mapping_token_01234567";
+    const auto control = std::make_shared<MappingPoseControl>(
+        MappingPose{MountingConfig{0, 0, 0.7F, 0, 0, 0}, true}, token);
+    auto decoded = bus.publisher<devices::LidarPointCloudMessage>(models::topics::pointcloud_decoded);
+    auto worlds = bus.subscribe<devices::LidarPointCloudMessage>(models::topics::pointcloud_world, "mount-world");
+    auto poses = bus.subscribe<models::LocalizationStatus>(models::topics::localization_status, "mount-pose");
+    auto views = bus.subscribe<models::RoomMapViewMessage>(models::topics::room_map_view, "mount-map");
+    const auto root = vista::fs::temp_directory_path() /
+        ("vista-mount-reset-" + std::to_string(platform::monotonic_timestamp_ns()));
+    vista::fs::create_directory(root);
+    struct RemoveTestFiles {
+        vista::fs::path path;
+        ~RemoveTestFiles() { std::error_code ignored; vista::fs::remove_all(path, ignored); }
+    } remove{root};
+    RoomMapConfig room;
+    room.enabled = true;
+    room.minimum_observations = 1;
+    room.publish_interval = 20ms;
+    room.freeze_after = 0ms;
+    room.file = root / "RoomMap.pcd";
+    room.storage_directory = root / "tiles";
+    room.mapping_control = control;
+    PointCloudWebSocketConfig socket;
+    socket.port = available_port();
+    socket.room_map_lod = true;
+    socket.mapping_control = control;
+    LioConfig lio;
+    lio.enabled = true;
+    lio.initial_position_m[2] = 0.7;
+    PreprocessingConfig preprocessing;
+    preprocessing.input_world_coordinates = true;
+    std::string map_error, lio_error, socket_error, preprocess_error;
+    std::vector<platform::WorkerHandle> workers;
+    struct FinishWorkers {
+        platform::MessageBus& bus;
+        platform::StopToken& stop;
+        std::vector<platform::WorkerHandle>& workers;
+        void join() { stop.request_stop(); bus.close(); for (auto& worker : workers) worker.join(); workers.clear(); }
+        ~FinishWorkers() { join(); }
+    } finish{bus, stop, workers};
+    workers.push_back(spawn_room_map_worker(bus, {"mount-room",4}, stop, room,
+        [&](auto, auto error) { map_error = std::move(error); }));
+    workers.push_back(spawn_preprocessing_worker(bus, {"mount-clean",3}, stop, preprocessing,
+        [&](auto, auto error) { preprocess_error = std::move(error); }));
+    workers.push_back(spawn_lio_worker(bus, {"mount-lio",3}, stop, lio,
+        [&](auto, auto error) { lio_error = std::move(error); }, control));
+    workers.push_back(spawn_pointcloud_websocket(bus, {"mount-socket",4}, stop, socket,
+        [&](auto, auto error) { socket_error = std::move(error); }));
+    std::this_thread::sleep_for(100ms);
+    Client client;
+    client.connect(socket.port);
+    client.handshake();
+
+    const auto read_control = [&](const std::string& expected) {
+        for (int i = 0; i < 25; ++i) {
+            const auto packet = client.read_frame();
+            if (packet.first != 1) continue;
+            std::string text(packet.second.begin(), packet.second.end());
+            if (text.find(expected) != std::string::npos) return text;
+        }
+        throw std::runtime_error("missing mapping WebSocket response: " + expected);
+    };
+    const auto wait_map = [&](std::uint64_t generation, std::uint64_t points) {
+        std::shared_ptr<const models::RoomMapViewMessage> message;
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (views.receive_for(message, 100ms) == platform::ReceiveStatus::message &&
+                message->mapping_generation == generation && message->point_count == points) return;
+        }
+        throw std::runtime_error("missing generation-specific Room Map checkpoint");
+    };
+    const auto scan = [&](std::uint64_t sequence) {
+        decoded.publish(devices::LidarPointCloudMessage("unitree-l2", sequence, std::nullopt, 1,
+            models::PointCloudFrame{1, {{1.0F, 0, 0, 12, 0, 0, 0}}},
+            platform::monotonic_timestamp_ns()));
+        std::shared_ptr<const devices::LidarPointCloudMessage> world;
+        if (worlds.receive_for(world, 1s) != platform::ReceiveStatus::message)
+            throw std::runtime_error("fixed mount produced no world cloud");
+        return world;
+    };
+
+    VISTA_CHECK(read_control("\"generation\":0").find("\"lioEnabled\":true") != std::string::npos);
+    client.send_bytes(masked_text("MAPPING MODE 0 invalid 0"));
+    VISTA_CHECK(read_control("\"type\":\"mapping-error\"").find("Invalid control token") != std::string::npos);
+    client.send_bytes(masked_text("MAPPING MODE 0 " + token + " 0"));
+    VISTA_CHECK(read_control("\"generation\":1").find("\"lioEnabled\":false") != std::string::npos);
+    const auto first = scan(1);
+    VISTA_CHECK(first->payload.mapping_generation == 1);
+    VISTA_CHECK(std::abs(first->payload.points.at(0).z - 0.7F) < 1e-5F);
+    wait_map(1, 1);
+
+    client.send_bytes(masked_text("MAPPING APPLY 0 " + token + " 10 0 2 0 0 90"));
+    VISTA_CHECK(read_control("\"type\":\"mapping-error\"").find("Active pose changed") != std::string::npos);
+    client.send_bytes(masked_text("MAPPING APPLY 1 " + token + " 10 0 2 0 0 900"));
+    VISTA_CHECK(read_control("\"type\":\"mapping-error\"").find("Mount rotation") != std::string::npos);
+    client.send_bytes(masked_text("MAPPING APPLY 1 " + token + " 10 0 2 0 0 90"));
+    VISTA_CHECK(read_control("\"generation\":2").find("\"mount\":[10,0,2,0,0,90]") != std::string::npos);
+    wait_map(2, 0);
+    VISTA_CHECK(transport::load_room_map_snapshot(room.file, 10).points.size() == 1);
+    const auto second = scan(2);
+    VISTA_CHECK(second->payload.mapping_generation == 2);
+    const auto& point = second->payload.points.at(0);
+    VISTA_CHECK(std::abs(point.x - 10.0F) < 1e-5F && std::abs(point.y - 1.0F) < 1e-5F &&
+                std::abs(point.z - 2.0F) < 1e-5F);
+    wait_map(2, 1);
+
+    client.send_bytes(masked_text("MAPPING MODE 2 " + token + " 1"));
+    VISTA_CHECK(read_control("\"generation\":3").find("\"lioEnabled\":true") != std::string::npos);
+    std::shared_ptr<const models::LocalizationStatus> pose;
+    while (poses.receive_for(pose, 1s) == platform::ReceiveStatus::message && pose->mapping_generation != 3) {}
+    VISTA_CHECK(pose && pose->mapping_generation == 3 && !pose->pose_valid &&
+                pose->state == models::LocalizationState::initializing);
+    VISTA_CHECK(std::abs(pose->position_m[0] - 10.0) < 1e-5);
+    wait_map(3, 0);
+
+    finish.join();
+    VISTA_CHECK(map_error.empty() && lio_error.empty() && socket_error.empty() && preprocess_error.empty());
+    unsigned pcd_count = 0;
+    for (const auto& entry : vista::fs::directory_iterator(root)) {
+        if (entry.path().extension() == ".pcd") ++pcd_count;
+    }
+    VISTA_CHECK(pcd_count == 2);
+}
+
+VISTA_TEST(settings_apply_validates_complete_candidate_and_keeps_defaults_in_memory) {
+    using namespace vista;
+    using namespace vista::application;
+    const std::string text = "Lidar: quanergy-m8\nIP (m8): 127.0.0.1\nTCPPort: 4141\n"
+        "LioImuAccelerationCovariance: 0.1\nLioImuGyroscopeCovariance: 0.12\n";
+    const auto initial = parse_device_config_text(text);
+    auto apply = [&](std::string group, SettingValues values) {
+        return validate_settings_request(text,initial,{1,0,std::move(group),std::move(values)},{});
+    };
+    const auto snapshot = runtime_setting_values(initial);
+    VISTA_CHECK(snapshot.at("LioImuAccelerationCovariance")=="0.1");
+    VISTA_CHECK(snapshot.at("LioImuGyroscopeCovariance")=="0.12");
+    VISTA_CHECK(snapshot.at("Camera")=="None" && snapshot.at("Radar")=="None");
+    auto paired = apply("lio_noise",{{"LioImuAccelerationCovariance","0.2"},{"LioImuGyroscopeCovariance","0.2"}});
+    VISTA_CHECK(paired.changes.size()==2);
+    VISTA_CHECK(settings_change_line("LioImuGyroscopeCovariance",paired.changes.at("LioImuGyroscopeCovariance"))==
+        "[settings] LioImuGyroscopeCovariance \"0.12\" -> \"0.2\"");
+    VISTA_CHECK(parse_device_config_text(text).lio.imu_gyroscope_covariance != paired.config.lio.imu_gyroscope_covariance);
+    const auto lidar = apply("lidar",{{"SensorPort","4142"},{"SensorIP","127.0.0.2"}});
+    VISTA_CHECK(lidar.config.sensor_port==4142 && lidar.config.sensor_ip=="127.0.0.2");
+    VISTA_CHECK(lidar.text.find("TCPPort:")==std::string::npos);
+    auto rejected = [&](const char* group, SettingValues values) {
+        try { (void)apply(group,std::move(values)); } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    VISTA_CHECK(rejected("lio_noise",{{"LioImuAccelerationCovariance","0.2"},{"LioImuGyroscopeCovariance","-1"}}));
+    VISTA_CHECK(rejected("logging",{{"LioEnabled","0"}}));
+    VISTA_CHECK(rejected("camera",{{"Camera","RealSense"}}));
+    VISTA_CHECK(rejected("room_map_io",{{"RoomMapWebSocketPort","9988"}}));
+    VISTA_CHECK(rejected("logging",{{"RawLoggingEnabled","1\nLidar: unitree-l2"}}));
+}
+
+VISTA_TEST(settings_websocket_authentication_and_session_state_are_shared) {
+    using namespace vista;
+    using namespace vista::application;
+    [[maybe_unused]] Runtime runtime;
+    platform::StopToken stop;
+    const auto initial = parse_device_config_text("Lidar: quanergy-m8\nSensorIP: 127.0.0.1\nSensorPort: 4141\n");
+    RuntimeSettings settings(initial);
+    const auto port = available_port();
+    const std::string token = "test_only_settings_token_01234567";
+    auto worker = spawn_settings_server(stop,"127.0.0.1",port,token,settings);
+    struct Finish {
+        platform::StopToken& stop;
+        platform::WorkerHandle& worker;
+        ~Finish() { stop.request_stop(); worker.join(); }
+    } finish{stop,worker};
+    auto read = [](Client& client, const std::string& match) {
+        for (int attempt=0;attempt<8;++attempt) {
+            const auto message = client.read_frame();
+            const std::string text(message.second.begin(),message.second.end());
+            if (message.first==1 && text.find(match)!=std::string::npos) return text;
+        }
+        throw std::runtime_error("Expected settings message was not sent");
+    };
+    Client operator_view;
+    operator_view.connect(port);
+    operator_view.handshake();
+    operator_view.send_bytes(masked_text("APPLY 0 logging\nRawLoggingEnabled=1"));
+    VISTA_CHECK(read(operator_view,"Enter the control token").find("settings")==std::string::npos);
+    operator_view.send_bytes(masked_text("AUTH not-the-token"));
+    read(operator_view,"Invalid control token");
+    operator_view.send_bytes(masked_text("AUTH "+token));
+    VISTA_CHECK(read(operator_view,"\"type\":\"state\"").find("\"RawLoggingEnabled\":\"0\"")!=std::string::npos);
+    read(operator_view,"\"type\":\"ports\"");
+    operator_view.send_bytes(masked_text("APPLY 0 logging\nRawLoggingEnabled=1"));
+    std::optional<SettingsRequest> request;
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (!request && std::chrono::steady_clock::now()<deadline) { request=settings.take(); std::this_thread::sleep_for(10ms); }
+    VISTA_CHECK(request && request->group=="logging" && request->values.at("RawLoggingEnabled")=="1");
+    auto active=initial; active.raw_logging_enabled=true;
+    settings.complete(*request,&active,"Applied");
+    VISTA_CHECK(read(operator_view,"\"revision\":1").find("\"RawLoggingEnabled\":\"1\"")!=std::string::npos);
+    read(operator_view,"\"type\":\"result\"");
+    operator_view.send_bytes(masked_text("APPLY 0 logging\nRawLoggingEnabled=0"));
+    read(operator_view,"Configuration has changed");
+
+    Client reopened;
+    reopened.connect(port);
+    reopened.handshake();
+    reopened.send_bytes(masked_text("AUTH "+token));
+    VISTA_CHECK(read(reopened,"\"revision\":1").find("\"RawLoggingEnabled\":\"1\"")!=std::string::npos);
+    VISTA_CHECK(!initial.raw_logging_enabled && !settings.take());
 }
 
 VISTA_TEST(gaussian_worker_and_websocket_use_full_map_checkpoint_and_clear_load_errors) {

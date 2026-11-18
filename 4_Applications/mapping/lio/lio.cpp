@@ -4,13 +4,19 @@
 #include "3_Devices/lidars/lidar.hpp"
 #include "models/topics.hpp"
 #include "1_Platform/timing/measurement_clock.hpp"
+#include "4_Applications/mapping/mapping_pose_control.hpp"
+#include "4_Applications/settings/runtime_settings.hpp"
+#include <iostream>
+#include "4_Applications/processing/pointcloud/pointcloud_processing.hpp"
 #include <algorithm>
+#include <cmath>
 #include <deque>
 #include <limits>
 
 namespace vista::application {
 platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
-    platform::ThreadConfig thread,platform::StopToken stop,LioConfig config,LioCompletion on_complete) {
+    platform::ThreadConfig thread,platform::StopToken stop,LioConfig config,LioCompletion on_complete,
+    std::shared_ptr<MappingPoseControl> mapping_control) {
     validate_lio_config(config);
     platform::WorkerTopicInputs inputs(thread.name);
     auto cloud=inputs.subscribe<devices::LidarPointCloudMessage>(bus,models::topics::pointcloud_decoded);
@@ -18,9 +24,19 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
     auto world=bus.publisher<devices::LidarPointCloudMessage>(models::topics::pointcloud_world);
     auto telemetry=bus.publisher<models::LocalizationStatus>(models::topics::localization_status);
     return platform::spawn_worker(std::move(thread),[stop,config,inputs=std::move(inputs),cloud=std::move(cloud),
-        imu=std::move(imu),world=std::move(world),telemetry=std::move(telemetry),on_complete=std::move(on_complete)]() mutable {
+        imu=std::move(imu),world=std::move(world),telemetry=std::move(telemetry),on_complete=std::move(on_complete),
+        mapping_control=std::move(mapping_control)]() mutable {
         try {
-            LioEngine engine(config);LioSynchronizer sync(config.maximum_imu_gap_s);
+            MappingPose active;
+            if (mapping_control) {
+                active = mapping_control->status().active;
+                const auto& mount = active.mount;
+                config.initial_position_m = {mount.mount_x_m, mount.mount_y_m, mount.mount_z_m};
+                config.initial_rpy_deg = {mount.mount_roll_deg, mount.mount_pitch_deg, mount.mount_yaw_deg};
+            }
+            std::optional<LioEngine> engine;
+            if (!mapping_control || active.lio_enabled) engine.emplace(config);
+            LioSynchronizer sync(config.maximum_imu_gap_s);
             LioReport report;models::LocalizationStatus latest;
             ImuSampleHistory imu_history;
             MeasurementEpochGate epochs;
@@ -42,7 +58,7 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
             std::optional<models::LocalizationState> published_state;bool published_valid{};
             auto reset_temporal=[&](const std::string& reason) {
                 recovery_reason=reason;++recovery_count;
-                latest=engine.restart_initialization();
+                latest=engine->restart_initialization();
                 sync.clear();previous_end.reset();pending.clear();early_imu.clear();
                 imu_history.clear();synchronization_wait_since.reset();
                 last_imu_source_time.reset();last_imu_host_time.reset();last_cloud_source_time.reset();
@@ -50,6 +66,83 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
                 clock_fault=false;fault_reason.clear();
                 heartbeat=std::chrono::steady_clock::now();
                 recovery.update(models::LocalizationState::initializing,heartbeat);
+            };
+            const auto set_fixed_pose = [&] {
+                latest = {};
+                latest.state = models::LocalizationState::fixed_mount;
+                latest.reason = "Fixed Mount pose; Point-LIO disabled";
+                latest.pose_valid = true;
+                const auto& mount = active.mount;
+                latest.position_m = {mount.mount_x_m, mount.mount_y_m, mount.mount_z_m};
+                constexpr double half_rad = 3.14159265358979323846 / 360.0;
+                const auto sr = std::sin(mount.mount_roll_deg * half_rad);
+                const auto cr = std::cos(mount.mount_roll_deg * half_rad);
+                const auto sp = std::sin(mount.mount_pitch_deg * half_rad);
+                const auto cp = std::cos(mount.mount_pitch_deg * half_rad);
+                const auto sy = std::sin(mount.mount_yaw_deg * half_rad);
+                const auto cy = std::cos(mount.mount_yaw_deg * half_rad);
+                latest.orientation_xyzw = {sr*cp*cy - cr*sp*sy, cr*sp*cy + sr*cp*sy,
+                                           cr*cp*sy - sr*sp*cy, cr*cp*cy + sr*sp*sy};
+            };
+            if (!engine) set_fixed_pose();
+
+            std::uint64_t reset_cutoff_ns{};
+            const auto apply_mapping_pose = [&](const MappingPose& requested) {
+                const auto old = active;
+                active = requested;
+                const auto& mount = active.mount;
+                config.initial_position_m = {mount.mount_x_m, mount.mount_y_m, mount.mount_z_m};
+                config.initial_rpy_deg = {mount.mount_roll_deg, mount.mount_pitch_deg, mount.mount_yaw_deg};
+                engine.reset();
+                if (active.lio_enabled) engine.emplace(config);
+                sync.clear();
+                previous_end.reset();
+                pending.clear();
+                early_imu.clear();
+                imu_history.clear();
+                epochs = MeasurementEpochGate{};
+                recovery = LioRecoveryTimer{};
+                synchronization_wait_since.reset();
+                last_imu_source_time.reset();
+                last_imu_host_time.reset();
+                last_cloud_source_time.reset();
+                imu_id.clear();
+                lidar_id.clear();
+                reference_host = 0;
+                have_reference = clock_fault = false;
+                fault_reason.clear();
+                recovery_reason.clear();
+                last_valid = heartbeat = std::chrono::steady_clock::now();
+                reset_cutoff_ns = platform::monotonic_timestamp_ns();
+                if (engine) {
+                    latest = engine->restart_initialization();
+                    latest.reason = "Mount/LIO settings applied; initializing Point-LIO from Mount";
+                } else set_fixed_pose();
+                published_state.reset();
+                const auto log = [](const char* key, float before, float after) {
+                    if (before != after)
+                        std::cout << settings_change_line(key,{numeric_setting_value(before),numeric_setting_value(after)}) + '\n';
+                };
+                log("MountX",old.mount.mount_x_m,active.mount.mount_x_m);
+                log("MountY",old.mount.mount_y_m,active.mount.mount_y_m);
+                log("MountZ",old.mount.mount_z_m,active.mount.mount_z_m);
+                log("MountRollDeg",old.mount.mount_roll_deg,active.mount.mount_roll_deg);
+                log("MountPitchDeg",old.mount.mount_pitch_deg,active.mount.mount_pitch_deg);
+                log("MountYawDeg",old.mount.mount_yaw_deg,active.mount.mount_yaw_deg);
+                if (old.lio_enabled != active.lio_enabled)
+                    std::cout << settings_change_line("LioEnabled",{old.lio_enabled ? "1" : "0",active.lio_enabled ? "1" : "0"}) + '\n';
+                std::cout << std::flush;
+                mapping_control->acknowledge(active.generation);
+            };
+
+            auto publish_world = [&](const devices::LidarPointCloudMessage& message, models::PointCloudFrame frame) {
+                frame.mapping_generation = active.generation;
+                world.publish(devices::LidarPointCloudMessage(message.lidar_id, message.sequence,
+                    message.sensor_timestamp_ns, message.received_timestamp_ns, std::move(frame),
+                    message.received_monotonic_ns, message.measurement_timestamp_ns,
+                    message.measurement_clock_epoch, message.measurement_epoch_started_ns));
+                ++report.published;
+                last_valid = std::chrono::steady_clock::now();
             };
             auto admit_epoch=[&](std::size_t stream,std::uint64_t epoch,std::uint64_t started,std::uint64_t received) {
                 const auto result=epochs.observe(stream,epoch,started,received);
@@ -98,7 +191,7 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
                 // snapshot. Bound work so a busy producer cannot starve scans.
                 for(std::size_t i=0;i<4096 && !stop.is_stop_requested();++i) {
                     if(imu.try_receive(message)!=platform::ReceiveStatus::message) break;
-                    accept_imu(*message);
+                    if (engine && message->received_monotonic_ns >= reset_cutoff_ns) accept_imu(*message);
                 }
             };
             auto drop_diagnostics=[&]() {
@@ -108,16 +201,25 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
                     "; early_imu_evictions="+std::to_string(early_imu_evictions);
             };
             while(!stop.is_stop_requested() && !cloud_closed) {
+                if (mapping_control) {
+                    if (auto requested = mapping_control->pending()) apply_mapping_pose(*requested);
+                }
                 const auto ready=inputs.wait_for(std::chrono::milliseconds(20));
                 drain_imu();
                 if(cloud.is_ready(ready)) {
                     std::shared_ptr<const devices::LidarPointCloudMessage> m;
-                    while(true) {
+                    for (std::size_t i = 0; i < cloud.capacity() && !stop.is_stop_requested(); ++i) {
                         const auto received=cloud.try_receive(m);
                         if(received==platform::ReceiveStatus::closed){cloud_closed=true;break;}
                         if(received!=platform::ReceiveStatus::message) break;
-                        if(m->payload.points.empty()) continue;
+                        if (m->payload.points.empty() || m->received_monotonic_ns < reset_cutoff_ns) continue;
                         ++report.received;
+                        if (!engine) {
+                            auto frame = m->payload;
+                            apply_fixed_mount(frame, active.mount);
+                            publish_world(*m, std::move(frame));
+                            continue;
+                        }
                         if(m->lidar_id.empty() || (!lidar_id.empty() && lidar_id!=m->lidar_id)) {fail("LiDAR source changed or sensor timestamp reset/replay loop");continue;}
                         if(!admit_epoch(1,m->measurement_clock_epoch,m->measurement_epoch_started_ns,m->received_monotonic_ns))continue;
                         if(clock_fault)continue;
@@ -155,7 +257,7 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
                     // A new IMU epoch can clear this deque while draining.
                     if(clock_fault || pending.empty()) break;
                     auto& p=pending.front();
-                    const auto horizon=engine.propagation_time_s();
+                    const auto horizon=engine->propagation_time_s();
                     const auto history_begin=horizon?horizon:previous_end;
                     const auto required_begin=history_begin?std::min(*history_begin,p.begin):p.begin;
                     const auto batch=sync.take(required_begin,p.end);
@@ -179,9 +281,9 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
                     const auto& frame=p.message->payload;
                     const auto point_reference=std::min_element(frame.points.begin(),frame.points.end(),[](const auto& a,const auto& b){return a.timestamp_ns<b.timestamp_ns;})->timestamp_ns;
                     const LioScanView scan{frame,p.begin,p.end,*batch,point_reference};
-                    auto output=engine.process(scan);latest=std::move(output.status);previous_end=p.end;
-                    if(const auto integrated=engine.propagation_time_s())sync.retain_from(*integrated);
-                    if(output.world_cloud){world.publish(devices::LidarPointCloudMessage(p.message->lidar_id,p.message->sequence,p.message->sensor_timestamp_ns,p.message->received_timestamp_ns,std::move(*output.world_cloud),p.message->received_monotonic_ns,p.message->measurement_timestamp_ns,p.message->measurement_clock_epoch,p.message->measurement_epoch_started_ns));++report.published;last_valid=std::chrono::steady_clock::now();}
+                    auto output=engine->process(scan);latest=std::move(output.status);previous_end=p.end;
+                    if(const auto integrated=engine->propagation_time_s())sync.retain_from(*integrated);
+                    if (output.world_cloud) publish_world(*p.message, std::move(*output.world_cloud));
                     else ++report.rejected;
                     pending.pop_front();
                     break;
@@ -198,7 +300,7 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
                     // stale temporal state; never guess a new world origin.
                     reset_temporal(latest.reason);
                 }
-                if(latest.pose_valid && now-last_valid>config.synchronization_timeout){latest.pose_valid=false;latest.state=models::LocalizationState::degraded;latest.reason="no fresh localized scan (input/processing delay); map held";}
+                if(engine && latest.pose_valid && now-last_valid>config.synchronization_timeout){latest.pose_valid=false;latest.state=models::LocalizationState::degraded;latest.reason="no fresh localized scan (input/processing delay); map held";}
                 // Fault/recovery transitions are delivered immediately; the 1 s
                 // heartbeat is monitoring cadence, not permission to hide LOST.
                 if(now>=heartbeat || !published_state || *published_state!=latest.state || published_valid!=latest.pose_valid) {
@@ -206,6 +308,7 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
                     latest.dropped_messages=report.dropped+cloud.dropped_messages()+imu.dropped_messages();
                     latest.rejected_scans=report.rejected;
                     auto diagnostic=latest;
+                    diagnostic.mapping_generation = active.generation;
                     diagnostic.reason+="; duplicate_imu_samples="+std::to_string(report.duplicate_imu_samples)+
                         "; reinitializations="+std::to_string(recovery_count)+
                         "; clock_epoch_recoveries="+std::to_string(clock_epoch_recoveries)+

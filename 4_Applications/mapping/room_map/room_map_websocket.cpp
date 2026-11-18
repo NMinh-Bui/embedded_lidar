@@ -8,11 +8,50 @@
 #include <unordered_map>
 #include "2_Transport/messaging/websocket_server.hpp"
 #include "models/topics.hpp"
+#include "4_Applications/mapping/mapping_pose_control.hpp"
 #include "4_Applications/mapping/gaussian_map/gaussian_map.hpp"
 
 namespace vista::application {
 namespace {
 using models::GaussianSurfaceMode;
+
+std::string mapping_state(const std::shared_ptr<MappingPoseControl>& control) {
+    const auto status = control->status();
+    const auto& mount = status.active.mount;
+    std::ostringstream json;
+    json.imbue(std::locale::classic());
+    json.precision(9);
+    json << std::boolalpha << R"({"type":"mapping-state","enabled":true,"generation":)"
+         << status.active.generation << R"(,"pending":)" << status.pending
+         << R"(,"lioEnabled":)" << status.active.lio_enabled << R"(,"mount":[)"
+         << mount.mount_x_m << ',' << mount.mount_y_m << ',' << mount.mount_z_m << ','
+         << mount.mount_roll_deg << ',' << mount.mount_pitch_deg << ',' << mount.mount_yaw_deg << "]}";
+    return json.str();
+}
+
+void request_mapping_change(const std::string& message, const std::shared_ptr<MappingPoseControl>& control) {
+    if (!control) throw std::invalid_argument("Remote mapping controls are disabled");
+    if (message.size() > 320) throw std::invalid_argument("Invalid mapping command");
+    std::istringstream input(message);
+    input.imbue(std::locale::classic());
+    std::string prefix, command, token, extra;
+    std::uint64_t generation{};
+    if (!(input >> prefix >> command >> generation >> token) || prefix != "MAPPING")
+        throw std::invalid_argument("Invalid mapping command");
+
+    if (command == "MODE") {
+        std::string mode;
+        if (!(input >> mode) || (mode != "0" && mode != "1") || (input >> extra))
+            throw std::invalid_argument("Invalid LIO mode");
+        control->request(token, generation, std::nullopt, mode == "1");
+    } else if (command == "APPLY") {
+        MountingConfig mount;
+        if (!(input >> mount.mount_x_m >> mount.mount_y_m >> mount.mount_z_m
+                    >> mount.mount_roll_deg >> mount.mount_pitch_deg >> mount.mount_yaw_deg) || (input >> extra))
+            throw std::invalid_argument("Mount requires six finite numeric values");
+        control->request(token, generation, mount, std::nullopt);
+    } else throw std::invalid_argument("Invalid mapping command");
+}
 
 const char* surface_mode_name(GaussianSurfaceMode mode) {
     switch (mode) {
@@ -66,7 +105,7 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
         try {
             struct ClientView {
                 models::RoomMapViewRequest request;
-                std::string requested_signature,sent_signature;
+                std::string requested_signature,sent_signature,sent_control_state;
                 std::uint64_t sent_revision{};
                 models::RoomMapState sent_state{models::RoomMapState::empty};
                 bool delivered{};
@@ -112,6 +151,15 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                     }
                     for(const auto& incoming:server->poll_text()) {
                         const auto found=views.find(incoming.client_id);if(found==views.end()) continue;
+                        if (!config.gaussian_map && incoming.text.rfind("MAPPING ", 0) == 0) {
+                            try {
+                                request_mapping_change(incoming.text, config.mapping_control);
+                            } catch (const std::invalid_argument& error) {
+                                server->send_text(incoming.client_id,
+                                    std::string(R"({"type":"mapping-error","message":")") + error.what() + "\"}");
+                            }
+                            continue;
+                        }
                         try {
                             const auto request=parse_room_map_view_request(incoming.text,config.maximum_points);
                             if(request.surface_mode!=GaussianSurfaceMode::full_surface && !config.gaussian_map)
@@ -120,6 +168,14 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                             found->second.requested_signature=incoming.text;
                         } catch(const std::exception&) {
                             server->send_text(incoming.client_id,"{\"type\":\"roommap-error\",\"message\":\"Invalid VIEW request\"}");
+                        }
+                    }
+                    if (!config.gaussian_map && config.mapping_control && !views.empty()) {
+                        const auto control_state = mapping_state(config.mapping_control);
+                        for (auto& entry : views) {
+                            auto& sent = entry.second.sent_control_state;
+                            if (sent != control_state && server->send_text(entry.first, control_state))
+                                sent = control_state;
                         }
                     }
                     if(!latest) continue;
@@ -158,7 +214,8 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                         std::ostringstream meta;meta.imbue(std::locale::classic());meta.precision(15);
                         meta<<"{\"type\":\"roommap\",\"revision\":"<<latest->revision
                             <<",\"totalPoints\":"<<latest->point_count<<",\"pointBudget\":"<<config.maximum_points
-                            <<",\"state\":"<<static_cast<unsigned>(state)<<",\"bounds\":[";
+                            <<",\"state\":"<<static_cast<unsigned>(state)
+                            <<",\"mappingGeneration\":"<<latest->mapping_generation<<",\"bounds\":[";
                         for(unsigned i=0;i<6;++i) {if(i) meta<<',';meta<<bounds[i];}meta<<"]";
                         if(config.gaussian_map) meta<<",\"supportsEdges\":true,\"supportsCorners\":true,\"surfaceMode\":\""
                             <<surface_mode_name(view.request.surface_mode)<<'"';

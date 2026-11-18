@@ -201,7 +201,8 @@ platform::WorkerHandle spawn_lidar_read_worker(
     LidarConnector connect_lidar,
     std::chrono::milliseconds reconnect_interval,
     std::shared_ptr<LidarDecoderSlot> decoder_slot,
-    LidarCompletion on_complete);
+    LidarCompletion on_complete,
+    std::shared_ptr<const std::atomic<std::chrono::milliseconds::rep>> live_reconnect_interval = {});
 
 platform::WorkerHandle spawn_lidar_decode_worker(
     platform::MessageBus& bus,

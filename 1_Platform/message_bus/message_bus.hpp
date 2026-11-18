@@ -21,7 +21,9 @@ private:
     class TopicHolderBase;
 
 public:
-    explicit MessageBus(std::size_t default_capacity = 16);
+    // Reconfigurable pipelines keep topics open while a producer is replaced.
+    enum class Lifetime { last_publisher, explicit_close };
+    explicit MessageBus(std::size_t default_capacity = 16, Lifetime lifetime = Lifetime::last_publisher);
 
     MessageBus(const MessageBus&) = delete;
     MessageBus& operator=(const MessageBus&) = delete;
@@ -70,8 +72,8 @@ private:
     template <typename T>
     class TopicHolder final : public TopicHolderBase {
     public:
-        TopicHolder(std::string name, std::size_t capacity)
-            : topic_(std::make_shared<Topic<T>>(std::move(name), capacity)) {}
+        TopicHolder(std::string name, std::size_t capacity, Lifetime lifetime)
+            : topic_(std::make_shared<Topic<T>>(std::move(name),capacity,lifetime == Lifetime::last_publisher)) {}
 
         std::type_index message_type() const noexcept override {
             return typeid(T);
@@ -110,13 +112,14 @@ private:
         if (configured != capacities_.end()) {
             capacity = configured->second;
         }
-        auto holder = std::make_shared<TopicHolder<T>>(name, capacity);
+        auto holder = std::make_shared<TopicHolder<T>>(name,capacity,lifetime_);
         auto typed_topic = holder->topic();
         topics_.emplace(name, std::move(holder));
         return typed_topic;
     }
 
     std::size_t default_capacity_;
+    Lifetime lifetime_;
     std::mutex mutex_;
     std::unordered_map<std::string, std::size_t> capacities_;
     std::unordered_map<std::string, std::shared_ptr<TopicHolderBase>> topics_;

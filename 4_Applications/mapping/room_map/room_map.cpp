@@ -1,4 +1,5 @@
 #include "4_Applications/mapping/room_map/room_map.hpp"
+#include "4_Applications/mapping/mapping_pose_control.hpp"
 
 #include <algorithm>
 #include <array>
@@ -443,6 +444,7 @@ platform::WorkerHandle spawn_room_map_worker(platform::MessageBus& bus, platform
                 output_file.emplace(config.file); // Lazy claim: no PCD without map data.
             bool ever_confirmed = false;
             std::uint64_t revision{};
+            auto mapping_generation = config.mapping_control ? config.mapping_control->generation() : 0;
             std::chrono::steady_clock::duration active_time{};
             std::optional<std::chrono::steady_clock::time_point> last_observation;
             std::shared_ptr<const models::RoomMapMessage> snapshot;
@@ -491,6 +493,30 @@ platform::WorkerHandle spawn_room_map_worker(platform::MessageBus& bus, platform
                     return false;
                 }
             };
+            const auto update_mapping_generation = [&]() {
+                if (!config.mapping_control || config.load_existing) return;
+                const auto generation = config.mapping_control->generation();
+                if (generation == mapping_generation) return;
+                // A completed PCD belongs to the previous world frame. Preserve
+                // it and start an independent session with a fresh scratch store.
+                const bool saved = save();
+                mapping_generation = generation;
+                if (saved) {
+                    status_override.reset();
+                    map.reset();
+                    output_file.reset();
+                    if (!config.file.empty()) output_file.emplace(config.file);
+                    saved_revision.reset();
+                    ever_confirmed = false;
+                    active_time = {};
+                    last_observation.reset();
+                } else {
+                    status_override = models::RoomMapState::storage_error;
+                }
+                view_source.reset();
+                dirty = true;
+                next_publish = std::chrono::steady_clock::now();
+            };
             // Publish an initial completed background even before the first scan.
             refresh_view();
             bool closed = false;
@@ -498,10 +524,12 @@ platform::WorkerHandle spawn_room_map_worker(platform::MessageBus& bus, platform
                 if (subscriber) {
                     std::shared_ptr<const devices::LidarPointCloudMessage> message;
                     auto received = subscriber->receive_for(message, std::chrono::milliseconds(50));
+                    update_mapping_generation();
                     const auto batch_deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(20);
                     for (std::size_t batch = 0; batch < 64 && received == platform::ReceiveStatus::message; ++batch) {
                         ++report.received_messages;
-                        if (!status_override && !config.load_existing && !message->payload.points.empty() && map.status().state != models::RoomMapState::frozen) {
+                        if (!status_override && !config.load_existing && message->payload.mapping_generation == mapping_generation &&
+                            !message->payload.points.empty() && map.status().state != models::RoomMapState::frozen) {
                             const auto now = std::chrono::steady_clock::now();
                             if (last_observation) active_time += std::min(now - *last_observation,
                                 std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(1)));
@@ -523,6 +551,7 @@ platform::WorkerHandle spawn_room_map_worker(platform::MessageBus& bus, platform
                 } else {
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
+                update_mapping_generation();
                 const auto now = std::chrono::steady_clock::now();
                 if (now >= next_publish) {
                     refresh_view();
@@ -540,6 +569,7 @@ platform::WorkerHandle spawn_room_map_worker(platform::MessageBus& bus, platform
                     if(!status_override) view.source=view_source;
                     view.revision=revision;view.timestamp_ns=status.timestamp_ns;
                     view.checkpoint_monotonic_ns=checkpoint_monotonic_ns;
+                    view.mapping_generation=mapping_generation;
                     view.point_count=status.point_count;view.state=status.state;
                     // Unchanged revision heartbeats let a late-started worker
                     // discover the current map. The WebSocket does not resend

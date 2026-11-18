@@ -26,11 +26,25 @@ public:
     }
 
     bool is_stop_requested() const noexcept {
-        return requested_->load(std::memory_order_acquire);
+        return requested_->load(std::memory_order_acquire) || local_stop_requested();
+    }
+
+    StopToken child() const {
+        auto token = *this;
+        token.local_ = std::make_shared<std::atomic_bool>(false);
+        return token;
+    }
+
+    void request_local_stop() const noexcept {
+        if (local_) local_->store(true, std::memory_order_release);
+    }
+
+    bool local_stop_requested() const noexcept {
+        return local_ && local_->load(std::memory_order_acquire);
     }
 
 private:
-    std::shared_ptr<std::atomic_bool> requested_;
+    std::shared_ptr<std::atomic_bool> requested_, local_;
 };
 
 /// Validated project-level priority where 1 is highest and 5 is lowest.
