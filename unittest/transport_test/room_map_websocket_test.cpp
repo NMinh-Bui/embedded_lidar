@@ -256,6 +256,52 @@ VISTA_TEST(gaussian_worker_and_websocket_use_full_map_checkpoint_and_clear_load_
     VISTA_CHECK(build_error.empty() && socket_error.empty() && report && report->completed_revisions==1);
 }
 
+VISTA_TEST(gaussian_surface_mode_parser_preserves_legacy_and_rejects_invalid_modes) {
+    const std::string view="VIEW 100 600 0 0 10 1 0 0 100 -1 0 0 100 0 1 0 100 0 -1 0 100 0 0 1 100 0 0 -1 100";
+    using vista::application::parse_room_map_view_request;
+    VISTA_CHECK(!parse_room_map_view_request(view,100).edges_only);
+    VISTA_CHECK(!parse_room_map_view_request(view+" FULL",100).edges_only);
+    VISTA_CHECK(parse_room_map_view_request(view+" EDGES",100).edges_only);
+    VISTA_CHECK_THROWS(parse_room_map_view_request(view+" CORNERS",100));
+    VISTA_CHECK_THROWS(parse_room_map_view_request(view+" EDGES extra",100));
+}
+
+VISTA_TEST(gaussian_websocket_switches_modes_on_frozen_map_without_camera_cooldown_or_cross_client_effects) {
+    struct Source final : vista::models::GaussianMapViewSource {
+        std::array<double,6> bounds() const override {return {-10,-10,-10,10,10,10};}
+        std::vector<vista::models::GaussianMapPoint> select_splats(const vista::models::RoomMapViewRequest& request) const override {
+            vista::models::GaussianMapPoint point;point.center={1,2,3,77};point.covariance={.1F,0,0,.1F,0,.1F};
+            return std::vector<vista::models::GaussianMapPoint>(request.edges_only?1:3,point);
+        }
+    };
+    Runtime runtime;vista::platform::MessageBus bus;vista::platform::StopToken stop;
+    auto publisher=bus.publisher<vista::models::RoomMapViewMessage>(vista::models::topics::gaussian_map_view);
+    vista::application::PointCloudWebSocketConfig config;config.gaussian_map=true;config.room_map_lod=true;
+    config.port=available_port();config.publish_interval=10s;config.maximum_points=10;
+    std::string failure;
+    auto worker=vista::application::spawn_pointcloud_websocket(bus,{"test-edge-mode",4},stop,config,
+        [&](auto,auto error){failure=std::move(error);});
+    struct Finish {vista::platform::StopToken& stop;vista::platform::MessageBus& bus;vista::platform::WorkerHandle& worker;
+        ~Finish(){stop.request_stop();bus.close();worker.join();}} finish{stop,bus,worker};
+    publisher.publish({std::make_shared<Source>(),1,1,3,vista::models::RoomMapState::frozen});
+    std::this_thread::sleep_for(100ms);
+    Client client,second;client.connect(config.port);client.handshake();
+    VISTA_CHECK(client.read_frame().first==1);VISTA_CHECK(client.read_frame().second.size()==32+3*44);
+    second.connect(config.port);second.handshake();
+    VISTA_CHECK(second.read_frame().first==1);VISTA_CHECK(second.read_frame().second.size()==32+3*44);
+    const std::string view="VIEW 10 600 0 0 10 1 0 0 100 -1 0 0 100 0 1 0 100 0 -1 0 100 0 0 1 100 0 0 -1 100";
+    const auto start=std::chrono::steady_clock::now();client.send_bytes(masked_text(view+" EDGES"));
+    const auto metadata=client.read_frame();const std::string text(metadata.second.begin(),metadata.second.end());
+    VISTA_CHECK(text.find("\"supportsEdges\":true")!=std::string::npos && text.find("\"surfaceMode\":\"edges\"")!=std::string::npos);
+    VISTA_CHECK(client.read_frame().second.size()==32+44);
+    client.send_bytes(masked_text(view));
+    VISTA_CHECK(client.read_frame().first==1);VISTA_CHECK(client.read_frame().second.size()==32+3*44);
+    VISTA_CHECK(std::chrono::steady_clock::now()-start<2s);
+    publisher.publish({std::make_shared<Source>(),2,2,3,vista::models::RoomMapState::frozen});
+    VISTA_CHECK(second.read_frame().first==1);VISTA_CHECK(second.read_frame().second.size()==32+3*44);
+    stop.request_stop();bus.close();worker.join();VISTA_CHECK(failure.empty());
+}
+
 VISTA_TEST(room_map_websocket_sends_new_checkpoint_without_second_interval_delay) {
     struct Source final : vista::models::RoomMapViewSource {
         mutable std::atomic<unsigned> queries{};

@@ -32,7 +32,12 @@ models::RoomMapViewRequest parse_room_map_view_request(const std::string& text,s
         if(length<1e-12) throw std::invalid_argument("empty room-map frustum plane");
         for(auto& value:plane) value/=length;
     }
-    std::string extra;if(input>>extra) throw std::invalid_argument("unexpected room-map view fields");
+    std::string extra;
+    if(input>>extra) {
+        if(extra=="EDGES") result.edges_only=true;
+        else if(extra!="FULL") throw std::invalid_argument("invalid surface mode");
+        if(input>>extra) throw std::invalid_argument("unexpected room-map view fields");
+    }
     result.has_camera=true;return result;
 }
 
@@ -51,6 +56,7 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                 std::uint64_t sent_revision{};
                 models::RoomMapState sent_state{models::RoomMapState::empty};
                 bool delivered{};
+                bool sent_edges{};
                 std::chrono::steady_clock::time_point next_send{};
             };
             PointCloudWebSocketReport report;
@@ -93,7 +99,9 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                     for(const auto& incoming:server->poll_text()) {
                         const auto found=views.find(incoming.client_id);if(found==views.end()) continue;
                         try {
-                            found->second.request=parse_room_map_view_request(incoming.text,config.maximum_points);
+                            const auto request=parse_room_map_view_request(incoming.text,config.maximum_points);
+                            if(request.edges_only && !config.gaussian_map) throw std::invalid_argument("edges require Gaussian map");
+                            found->second.request=request;
                             found->second.requested_signature=incoming.text;
                         } catch(const std::exception&) {
                             server->send_text(incoming.client_id,"{\"type\":\"roommap-error\",\"message\":\"Invalid VIEW request\"}");
@@ -106,7 +114,8 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                         auto& view=entry.second;
                         const bool map_changed=!view.delivered || view.sent_revision!=latest->revision ||
                             view.sent_state!=latest->state;
-                        if(!map_changed && (now<view.next_send ||
+                        const bool mode_changed=view.delivered && view.sent_edges!=view.request.edges_only;
+                        if(!map_changed && !mode_changed && (now<view.next_send ||
                             view.sent_signature==view.requested_signature)) continue;
                         // The producer has ALREADY checkpointed this revision at
                         // RoomMapPublishIntervalMilliseconds. Do not add a second
@@ -135,7 +144,10 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                         meta<<"{\"type\":\"roommap\",\"revision\":"<<latest->revision
                             <<",\"totalPoints\":"<<latest->point_count<<",\"pointBudget\":"<<config.maximum_points
                             <<",\"state\":"<<static_cast<unsigned>(state)<<",\"bounds\":[";
-                        for(unsigned i=0;i<6;++i) {if(i) meta<<',';meta<<bounds[i];}meta<<"]}";
+                        for(unsigned i=0;i<6;++i) {if(i) meta<<',';meta<<bounds[i];}meta<<"]";
+                        if(config.gaussian_map) meta<<",\"supportsEdges\":true,\"surfaceMode\":\""
+                            <<(view.request.edges_only?"edges":"full_surface")<<'"';
+                        meta<<'}';
                         cloud.timestamp_ns=latest->timestamp_ns;
                         models::RoomMapMessage frame(latest->revision,
                             latest->timestamp_ns,std::move(cloud));
@@ -145,6 +157,7 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                             ++report.broadcast_frames;++report.client_deliveries;
                             report.encoded_points+=config.gaussian_map?splats.size():frame.payload.points.size();
                             view.delivered=true;view.sent_revision=latest->revision;view.sent_state=latest->state;
+                            view.sent_edges=view.request.edges_only;
                             view.sent_signature=view.requested_signature;
                         }
                         // Bound repeated camera queries without delaying a new map.

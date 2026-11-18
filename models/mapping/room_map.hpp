@@ -77,6 +77,8 @@ struct RoomMapViewRequest {
     std::array<double,3> camera{};
     std::array<std::array<double,4>,6> planes{};
     bool has_camera{false};
+    // Gaussian rendering only; the complete RoomMap geometry is unchanged.
+    bool edges_only{false};
 };
 /// Workers share a disk reader, NOT a full-map copy. Disk queries are serialized
 /// with page replacement, but never hold the live accumulator update mutex.

@@ -39,7 +39,7 @@ Voxel voxel(const models::RoomMapPoint& p,float size) {
     return {static_cast<std::int64_t>(x),static_cast<std::int64_t>(y),static_cast<std::int64_t>(z)};
 }
 // Symmetric Jacobi eigensolver: no ROS/GPU or new numerical dependency.
-std::array<double,3> normal(double a[3][3],bool& planar,double scale) {
+std::array<double,3> normal(double a[3][3],bool& planar,double scale,std::array<double,3>& eigenvalues) {
     double v[3][3]{{1,0,0},{0,1,0},{0,0,1}};
     for(unsigned step=0;step<16;++step) {
         unsigned p=0,q=1;
@@ -59,6 +59,7 @@ std::array<double,3> normal(double a[3][3],bool& planar,double scale) {
     std::array<unsigned,3> indices{0,1,2};
     std::sort(indices.begin(),indices.end(),[&](auto i,auto j){return a[i][i]<a[j][j];});
     planar=a[indices[1]][indices[1]]>scale*scale*.04 && a[indices[0]][indices[0]]<.15*a[indices[1]][indices[1]];
+    for(unsigned i=0;i<3;++i) eigenvalues[i]=std::max(0.0,a[indices[i]][indices[i]]);
     return {v[0][indices[0]],v[1][indices[0]],v[2][indices[0]]};
 }
 // One bounded padded lookup table per active tile. Neighborhood order and all
@@ -88,15 +89,17 @@ public:
         return entries[(static_cast<std::size_t>(x)*ny+static_cast<std::size_t>(y))*nz+static_cast<std::size_t>(z)];
     }
 };
-Point fit(const models::RoomMapPoint& center,const DenseCells& cells,float size) {
+Point fit(const models::RoomMapPoint& center,const DenseCells& cells,float size,bool& edge) {
+    edge=false;
     const auto key=voxel(center,size);
     double mean[3]{},moments[3][3]{};unsigned count{};
+    std::array<std::array<double,3>,343> offsets;
     const double radius2=static_cast<double>(size)*size*6.25;
     for(int x=-3;x<=3;++x) for(int y=-3;y<=3;++y) for(int z=-3;z<=3;++z) {
         const auto* found=cells.find({key.x+x,key.y+y,key.z+z});if(!found) continue;
         const auto& p=*found;const double d[3]{p.x-center.x,p.y-center.y,p.z-center.z};
         if(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]>radius2) continue;
-        ++count;
+        offsets[count++]={d[0],d[1],d[2]};
         for(unsigned i=0;i<3;++i) {mean[i]+=d[i];for(unsigned j=0;j<3;++j) moments[i][j]+=d[i]*d[j];}
     }
     Point result;result.center=center;
@@ -104,7 +107,41 @@ Point fit(const models::RoomMapPoint& center,const DenseCells& cells,float size)
     if(count<6) return result;
     for(unsigned i=0;i<3;++i) for(unsigned j=0;j<3;++j)
         moments[i][j]=moments[i][j]/count-mean[i]*mean[j]/(static_cast<double>(count)*count);
-    bool planar{};const auto n=normal(moments,planar,size);if(!planar) return result;
+    bool planar{};std::array<double,3> eigenvalues{};
+    const auto n=normal(moments,planar,size,eigenvalues);
+    const auto trace=eigenvalues[0]+eigenvalues[1]+eigenvalues[2];
+    // Reuse the surface fit: supported creases/curves or thin linear geometry.
+    // Isolated points and roughly isotropic 3D noise are not geometric edges.
+    if(count>=8 && trace>size*size*.1) {
+        edge=(eigenvalues[1]<eigenvalues[2]*.12) ||
+            (eigenvalues[0]>=eigenvalues[1]*.15 && eigenvalues[0]<trace*.18);
+        if(planar) {
+            double normal_mean{},mean2{};
+            for(unsigned i=0;i<3;++i) {normal_mean+=mean[i]*n[i]/count;mean2+=mean[i]*mean[i]/(count*count);}
+            // Only one-sided neighborhoods need the angular boundary check.
+            // Full rings across tile halos suppress internal tile seams.
+            if(mean2-normal_mean*normal_mean>trace*.2) {
+                const unsigned axis=std::abs(n[0])<.8?0U:1U;
+                std::array<double,3> u{},v{};
+                u[axis]=1;double length{};
+                for(unsigned i=0;i<3;++i) {u[i]-=n[axis]*n[i];length+=u[i]*u[i];}
+                for(auto& value:u) value/=std::sqrt(length);
+                v={n[1]*u[2]-n[2]*u[1],n[2]*u[0]-n[0]*u[2],n[0]*u[1]-n[1]*u[0]};
+                std::array<bool,12> occupied{};unsigned bins{};
+                for(unsigned j=0;j<count;++j) {
+                    double x{},y{};for(unsigned i=0;i<3;++i) {x+=offsets[j][i]*u[i];y+=offsets[j][i]*v[i];}
+                    if(x*x+y*y<size*size*.5625) continue;
+                    const auto angle=std::atan2(y,x)+3.141592653589793;
+                    const auto bin=std::min(11U,static_cast<unsigned>(angle*(12.0/(2*3.141592653589793))));
+                    if(!occupied[bin]) {occupied[bin]=true;++bins;}
+                }
+                unsigned gap{},largest{};
+                for(unsigned j=0;j<24;++j) {gap=occupied[j%12]?0:gap+1;largest=std::max(largest,gap);}
+                edge=bins>=4 && largest>=5;
+            }
+        }
+    }
+    if(!planar) return result;
     const double tangent=size*size*.3025,thickness=size*size*.0064,difference=thickness-tangent;
     result.covariance={static_cast<float>(tangent+difference*n[0]*n[0]),static_cast<float>(difference*n[0]*n[1]),
         static_cast<float>(difference*n[0]*n[2]),static_cast<float>(tangent+difference*n[1]*n[1]),
@@ -113,7 +150,7 @@ Point fit(const models::RoomMapPoint& center,const DenseCells& cells,float size)
 }
 struct Page {
     std::shared_ptr<transport::detail::SessionDirectory> directory;
-    vista::fs::path file;std::uint64_t count{};std::array<double,6> bounds{};
+    vista::fs::path file;std::uint64_t count{},edge_count{};std::array<double,6> bounds{};
     ~Page() {std::error_code ignored;vista::fs::remove(file,ignored);}
 };
 class View final : public models::GaussianMapViewSource {
@@ -131,7 +168,8 @@ public:
                 if(plane[0]*b[plane[0]>=0?3:0]+plane[1]*b[plane[1]>=0?4:1]+
                    plane[2]*b[plane[2]>=0?5:2]+plane[3]<0) {outside=true;break;}
             }
-            if(!outside && page->count) {visible.push_back(page);total+=page->count;}
+            const auto count=request.edges_only?page->edge_count:page->count;
+            if(!outside && count) {visible.push_back(page);total+=count;}
         }
         std::vector<Point> result;result.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(total,request.point_budget)));
         // Fixed-width random access bounds disk reads by the view budget, not map size.
@@ -139,11 +177,14 @@ public:
         std::uint64_t base{},sample_index{};
         for(const auto& page:visible) {
             vista::io::ifstream in(page->file,std::ios::binary);
+            const auto count=request.edges_only?page->edge_count:page->count;
+            const auto offset=request.edges_only?page->count:0;
+            if(offset) in.seekg(static_cast<std::streamoff>(offset*41));
             std::uint64_t next_record{};
             while(sample_index<wanted) {
                 const auto index=static_cast<std::uint64_t>((static_cast<long double>(sample_index)+.5L)*total/wanted);
-                if(index>=base+page->count) break;
-                if(index-base!=next_record)in.seekg(static_cast<std::streamoff>((index-base)*41));
+                if(index>=base+count) break;
+                if(index-base!=next_record)in.seekg(static_cast<std::streamoff>((offset+index-base)*41));
                 next_record=index-base+1;
                 auto p=read_point(in);bool inside=true;
                 if(request.has_camera) for(const auto& plane:request.planes)
@@ -151,7 +192,7 @@ public:
                 if(inside) result.push_back(p);
                 ++sample_index;
             }
-            base+=page->count;
+            base+=count;
         }
         return result;
     }
@@ -234,10 +275,15 @@ std::shared_ptr<const models::GaussianMapViewSource> GaussianMapBuilder::update(
         page->bounds={k[0]*source.tile_size,k[1]*source.tile_size,k[2]*source.tile_size,
             (k[0]+1)*source.tile_size,(k[1]+1)*source.tile_size,(k[2]+1)*source.tile_size};
         vista::io::ofstream out(page->file,std::ios::binary|std::ios::trunc);
+        std::vector<Point> edges;
         for(std::size_t i=0;i<centers.size();++i) {
             if(i%256==0 && cancelled && cancelled()) return {};
-            write_point(out,fit(centers[i],lookup,source.voxel_size));
+            bool edge_splat{};const auto point=fit(centers[i],lookup,source.voxel_size,edge_splat);
+            write_point(out,point);if(edge_splat) edges.push_back(point);
         }
+        // Append a compact contiguous edge view. Both modes retain bounded
+        // random access; changing a camera never repeats neighborhood fitting.
+        page->edge_count=edges.size();for(const auto& point:edges) write_point(out,point);
         out.flush();if(!out) throw std::runtime_error("cannot flush Gaussian cache");out.close();
         next->pages.insert_or_assign(k,std::move(page));++impl_->rebuilt;
     }

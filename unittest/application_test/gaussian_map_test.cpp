@@ -178,6 +178,48 @@ VISTA_TEST(gaussian_optional_snapshot_failure_does_not_break_room_map_checkpoint
 }
 
 // Optional real-map validation without storing a capture/test fixture in Git.
+VISTA_TEST(gaussian_edges_remove_flat_interiors_without_tile_seams_and_keep_boundaries) {
+    auto s=store();for(int x=-12;x<=12;++x) for(int y=-12;y<=12;++y) add(*s,x,y);
+    add(*s,40,40); // An isolated return is not an edge.
+    vista::application::GaussianMapBuilder builder;
+    const auto snapshot=s->view_source(1)->surface_snapshot();
+    const auto view=builder.update(*snapshot);
+    vista::models::RoomMapViewRequest request;request.point_budget=2000;
+    const auto full=view->select_splats(request);VISTA_CHECK(full.size()==626);
+    request.edges_only=true;const auto edges=view->select_splats(request);
+    VISTA_CHECK(edges.size()>20 && edges.size()<full.size()/2);
+    for(const auto& point:edges) {
+        VISTA_CHECK(std::abs(point.center.x)>.9F || std::abs(point.center.y)>.9F);
+        VISTA_CHECK(point.center.x<3 && point.center.y<3);
+    }
+    const auto built=builder.rebuilt_tiles();request.point_budget=7;
+    VISTA_CHECK(view->select_splats(request).size()==7);
+    VISTA_CHECK(builder.rebuilt_tiles()==built);
+    request.edges_only=false;request.point_budget=2000;
+    const auto restored=view->select_splats(request);VISTA_CHECK(restored.size()==full.size());
+    for(std::size_t i=0;i<full.size();++i) VISTA_CHECK(restored[i].center==full[i].center && restored[i].covariance==full[i].covariance);
+}
+
+VISTA_TEST(gaussian_edges_keep_supported_creases_and_rebuild_after_neighbor_deletions) {
+    auto s=store();
+    for(int x=0;x<=16;++x) for(int y=-10;y<=10;++y) add(*s,x,y);
+    for(int z=1;z<=16;++z) for(int y=-10;y<=10;++y) add(*s,0,y,z);
+    vista::application::GaussianMapBuilder builder;
+    const auto first=builder.update(*s->view_source(1)->surface_snapshot());
+    vista::models::RoomMapViewRequest request;request.point_budget=2000;request.edges_only=true;
+    const auto old=first->select_splats(request);unsigned crease{};
+    for(const auto& p:old) if(p.center.x<.2F && p.center.z<.2F && std::abs(p.center.y)<.5F) ++crease;
+    VISTA_CHECK(crease>=8);
+    for(int x=0;x<8;++x) for(int y=-3;y<=3;++y) s->erase({x,y,0});
+    const auto source=s->view_source(2)->surface_snapshot();
+    const auto updated=builder.update(*source);vista::application::GaussianMapBuilder fresh;
+    const auto expected=fresh.update(*source)->select_splats(request),actual=updated->select_splats(request);
+    VISTA_CHECK(actual.size()==expected.size());
+    for(std::size_t i=0;i<actual.size();++i) VISTA_CHECK(actual[i].center==expected[i].center && actual[i].covariance==expected[i].covariance);
+    VISTA_CHECK(first->select_splats(request).size()==old.size());
+    auto empty=*source;empty.regions.clear();VISTA_CHECK(builder.update(empty)->select_splats(request).empty());
+}
+
 VISTA_TEST(gaussian_optional_real_pcd_fixture) {
     const auto path=std::getenv("VISTA_GAUSSIAN_TEST_PCD");if(!path) return;
     vista::application::RoomMapConfig config;config.surface_snapshots=true;
@@ -193,4 +235,8 @@ VISTA_TEST(gaussian_optional_real_pcd_fixture) {
     std::cout<<"Gaussian real PCD: "<<map.status().point_count<<" source points, "<<points.size()
         <<" visible splats, "<<builder.rebuilt_tiles()<<" tiles, "
         <<std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()<<" s (load + fit + view)\n";
+    request.edges_only=true;const auto edges=view->select_splats(request);
+    VISTA_CHECK(edges.size()<=request.point_budget);
+    std::cout<<"Gaussian real PCD edges: "<<edges.size()<<" visible splats, "
+        <<vista::application::encode_gaussian_map(edges,1,1).size()<<" bytes\n";
 }
