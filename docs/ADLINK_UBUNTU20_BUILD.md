@@ -79,11 +79,11 @@ cd embedded_lidar/out/build/linux-adlink-ubuntu20-arm64
 ./vista_edge
 ```
 
-- The executable is `vista_edge`, not a Windows `.exe`. Keep `DeviceConfig.txt`
-  and optional `GrafanaSecret.txt` beside it. They are resolved relative to the
-  executable, so launching from another working directory is supported.
+- Keep DeviceConfig.txt, GrafanaSecret.txt and MappingControlSecret.txt beside
+  vista_edge. The application finds them relative to the executable, including
+  when you start it from another directory.
 - Missing sidecars are created automatically: device settings are embedded from
-  `config/DeviceConfig.defaults.txt` at build time; `GrafanaToken:` is left blank.
+  `config/DeviceConfig.defaults.txt` at build time. Both token fields start blank.
   Existing files are never overwritten. After creating a device config the app
   exits before starting hardware: review the COM/IP settings, then run it again.
   The executable directory needs write permission only when creating a file.
@@ -98,8 +98,10 @@ cd embedded_lidar/out/build/linux-adlink-ubuntu20-arm64
   Windows; RoomMap/Gaussian WebSocket panel URLs must point to ADLINK's LAN
   address. Bind listeners to the intended LAN interface and restrict firewall
   access. These listeners are not authenticated public services.
-- Keep `GrafanaSecret.txt`, if used, local and out of Git. No dashboard/plugin
-  update or application configuration change is required just for this build change.
+- Enter the Room Map and Edge Settings control token on the MappingControlToken
+  line in MappingControlSecret.txt, then restart vista_edge. A nonempty
+  VISTA_MAPPING_CONTROL_TOKEN environment variable takes precedence. Keep both
+  secret files local and out of Git.
 
 ## Validation boundary
 

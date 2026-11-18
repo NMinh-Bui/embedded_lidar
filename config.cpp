@@ -1,5 +1,6 @@
 #include "config.hpp"
 #include "1_Platform/os/paths.hpp"
+#include "4_Applications/mapping/mapping_pose_control.hpp"
 #include "default_device_config.hpp"
 
 #include <algorithm>
@@ -645,14 +646,55 @@ StartupConfigFiles create_missing_startup_config_files(
         "# Grafana service-account token. Keep this file private; do not commit it.\n"
         "# Paste your token after the colon, then restart the application.\n"
         "GrafanaToken: \n");
+    result.mapping_control_secret_created = platform::create_text_file_if_missing(
+        root / mapping_control_secret_file_name,
+        "# Shared token for Room Map and VISTA Edge Settings. Keep this file private.\n"
+        "# Paste a token after the colon, then restart the application.\n"
+        "MappingControlToken: \n");
     for (const auto* name : {default_device_config_path,
-             application::grafana_secret_file_name}) {
+             application::grafana_secret_file_name, mapping_control_secret_file_name}) {
         if (!vista::fs::is_regular_file(root / name)) {
             throw std::runtime_error("configuration is not a regular file: " +
                 (root / name).u8string());
         }
     }
     return result;
+}
+
+std::optional<std::string> load_mapping_control_token(const vista::fs::path& directory,
+    std::string_view environment_token) {
+    const auto validate = [](std::string value, const char* source) -> std::optional<std::string> {
+        if (value.empty()) return std::nullopt;
+        if (!application::MappingPoseControl::valid_token(value)) {
+            throw std::invalid_argument(std::string(source) +
+                " requires a 24-128 character token using ASCII letters, digits, hyphens or underscores");
+        }
+        return value;
+    };
+    if (!environment_token.empty())
+        return validate(std::string(environment_token), "VISTA_MAPPING_CONTROL_TOKEN");
+
+    const auto file = directory / mapping_control_secret_file_name;
+    vista::io::ifstream input(file, std::ios::binary);
+    if (!input)
+        throw std::runtime_error(std::string("could not read ") + mapping_control_secret_file_name);
+
+    std::optional<std::string> token;
+    std::size_t line_number{};
+    for (std::string line; std::getline(input, line);) {
+        if (++line_number == 1 && line.compare(0,3,"\xEF\xBB\xBF") == 0) line.erase(0,3);
+        line = trim(std::move(line));
+        if (line.empty() || line.front() == '#') continue;
+        const auto colon = line.find(':');
+        if (colon == std::string::npos || trim(line.substr(0,colon)) != "MappingControlToken" || token) {
+            throw std::invalid_argument(std::string(mapping_control_secret_file_name) +
+                " accepts one MappingControlToken entry (line " + std::to_string(line_number) + ")");
+        }
+        token = trim(line.substr(colon + 1));
+    }
+    if (input.bad())
+        throw std::runtime_error(std::string("failed reading ") + mapping_control_secret_file_name);
+    return validate(token.value_or(""), mapping_control_secret_file_name);
 }
 
 vista::fs::path default_device_config_file() {

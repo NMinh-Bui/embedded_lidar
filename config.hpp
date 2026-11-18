@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "1_Platform/threading/threading.hpp"
 #include "3_Devices/lidars/lidar.hpp"
@@ -22,17 +23,21 @@
 namespace vista {
 
 inline constexpr const char* default_device_config_path = "DeviceConfig.txt";
+inline constexpr const char* mapping_control_secret_file_name = "MappingControlSecret.txt";
 /// DeviceConfig.txt beside the running executable, not the working directory.
 vista::fs::path default_device_config_file();
 
 struct StartupConfigFiles {
     bool device_config_created{};
     bool grafana_secret_created{};
+    bool mapping_control_secret_created{};
 };
 /// Creates only missing sidecars in this directory. Device defaults come from
-/// the source TXT at build time; the Grafana token is ALWAYS empty.
+/// the source TXT at build time. Newly created secret files have blank tokens.
 StartupConfigFiles create_missing_startup_config_files(
     const vista::fs::path& directory);
+std::optional<std::string> load_mapping_control_token(const vista::fs::path& directory,
+    std::string_view environment_token = {});
 
 /// Lets main decide which independent workers exist in this application run.
 struct WorkerConfig {

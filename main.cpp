@@ -138,19 +138,18 @@ std::string restart_summary(const std::set<Task>& tasks) {
     return "Applied for this session.";
 }
 
-void run_capture(AppConfig active, std::string device_text) {
+void run_capture(AppConfig active, std::string device_text, const std::optional<std::string>& token) {
     const auto root = application_data_root();
     const auto session_start = std::chrono::system_clock::now();
     auto config = active;
     configure_session_output_paths(config,root,session_start);
     auto runtime = config.runtime_config();
-    const auto* token = std::getenv("VISTA_MAPPING_CONTROL_TOKEN");
-    const bool use_control = token && MappingPoseControl::valid_token(token);
+    const bool use_control = token.has_value();
     std::shared_ptr<MappingPoseControl> mapping_control;
     if (use_control) {
         mapping_control = std::make_shared<MappingPoseControl>(
-            MappingPose{config.mounting.value_or(MountingConfig{}),config.lio.enabled},token);
-    } else if (token) std::cerr << "Invalid VISTA_MAPPING_CONTROL_TOKEN; remote controls disabled\n";
+            MappingPose{config.mounting.value_or(MountingConfig{}),config.lio.enabled},*token);
+    }
 
     platform::StopToken stop;
     platform::MessageBus bus(16,use_control ? platform::MessageBus::Lifetime::explicit_close :
@@ -352,7 +351,7 @@ void run_capture(AppConfig active, std::string device_text) {
             const auto& bind = active.settings_bind_address.empty() ? active.room_map_websocket.bind_address :
                 active.settings_bind_address;
             try {
-                settings_server.emplace(spawn_settings_server(stop,bind,active.settings_port,token,settings));
+                settings_server.emplace(spawn_settings_server(stop,bind,active.settings_port,*token,settings));
             } catch (const std::exception& error) {
                 std::cerr << "Settings WebSocket unavailable: " << error.what() << '\n';
             }
@@ -408,6 +407,10 @@ int main() {
         if (created.grafana_secret_created) {
             std::cout << "Created GrafanaSecret.txt beside the executable with an "
                          "empty GrafanaToken. Fill it in to enable Grafana authentication.\n";
+        }
+        if (created.mapping_control_secret_created) {
+            std::cout << "Created MappingControlSecret.txt beside the executable. "
+                         "Fill in MappingControlToken to enable remote controls.\n";
         }
         if (created.device_config_created) {
             // Do not issue hardware mode/restart commands with unreviewed defaults.
@@ -512,7 +515,15 @@ int main() {
             std::cout<<"Foreground: live world points outside confirmed RoomMap; not a motion label\n";
         if(config.foreground_websocket.enabled)
             std::cout<<"Foreground WebSocket: ws://"<<config.foreground_websocket.bind_address<<':'<<config.foreground_websocket.port<<'\n';
-        run_capture(std::move(active),std::move(device_text));
+        std::optional<std::string> mapping_token;
+        try {
+            const auto* environment_token = std::getenv("VISTA_MAPPING_CONTROL_TOKEN");
+            mapping_token = vista::load_mapping_control_token(config_path.parent_path(),
+                environment_token ? environment_token : "");
+        } catch (const std::exception& error) {
+            std::cerr << "Remote controls disabled: " << error.what() << '\n';
+        }
+        run_capture(std::move(active),std::move(device_text),mapping_token);
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n';

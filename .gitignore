@@ -19,3 +19,4 @@
 *.pcd
 *.points.tmp
 /GrafanaSecret.txt
+MappingControlSecret.txt

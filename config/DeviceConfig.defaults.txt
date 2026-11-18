@@ -89,7 +89,8 @@ GrafanaPublishIntervalMilliseconds: 2000
 GrafanaRetryIntervalSeconds: 5
 SystemMonitorIntervalMilliseconds: 2000
 
-# Remote settings use VISTA_MAPPING_CONTROL_TOKEN. Blank inherits the Room Map bind address.
+# Set the remote control token in MappingControlSecret.txt beside the executable.
+# A blank settings bind address inherits the Room Map bind address.
 SettingsWebSocketBindAddress:
 SettingsWebSocketPort: 8769
 

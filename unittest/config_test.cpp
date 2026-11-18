@@ -57,7 +57,12 @@ VISTA_TEST(config_bootstrap_creates_valid_defaults_and_blank_token_in_unicode_di
     const auto secret = read_config_test_file(folder / "GrafanaSecret.txt");
     VISTA_CHECK(secret.find("GrafanaToken: \n") != std::string::npos);
     VISTA_CHECK(secret.find("glsa_") == std::string::npos);
+    VISTA_CHECK(created.mapping_control_secret_created);
+    VISTA_CHECK(read_config_test_file(folder / "MappingControlSecret.txt").find("MappingControlToken: \n")
+        != std::string::npos);
+    VISTA_CHECK(!vista::load_mapping_control_token(folder));
     const auto repeated = vista::create_missing_startup_config_files(folder);
+    VISTA_CHECK(!repeated.mapping_control_secret_created);
     VISTA_CHECK(!repeated.device_config_created && !repeated.grafana_secret_created);
 }
 
@@ -88,6 +93,25 @@ VISTA_TEST(config_bootstrap_missing_device_preserves_existing_secret_exactly) {
     const auto created = vista::create_missing_startup_config_files(tree.root);
     VISTA_CHECK(created.device_config_created && !created.grafana_secret_created);
     VISTA_CHECK(read_config_test_file(tree.root / "GrafanaSecret.txt") == secret);
+}
+
+VISTA_TEST(mapping_control_secret_loads_private_file_and_accepts_environment_override) {
+    ConfigTestDirectory tree;
+    constexpr auto from_file = "test_only_mapping_file_01234567";
+    constexpr auto from_env = "test_only_mapping_environment_01";
+    const auto path = tree.root / vista::mapping_control_secret_file_name;
+    const std::string contents = std::string("\xEF\xBB\xBF# Windows UTF-8 BOM and CRLF\r\nMappingControlToken: ") +
+        from_file + "\r\n";
+    { vista::io::ofstream out(path, std::ios::binary); out << contents; }
+    VISTA_CHECK(vista::load_mapping_control_token(tree.root) == from_file);
+    VISTA_CHECK(vista::load_mapping_control_token(tree.root, from_env) == from_env);
+    VISTA_CHECK(!vista::create_missing_startup_config_files(tree.root).mapping_control_secret_created);
+    VISTA_CHECK(read_config_test_file(path) == contents);
+    VISTA_CHECK_THROWS(vista::load_mapping_control_token(tree.root, "short"));
+    { vista::io::ofstream out(path); out << "MappingControlToken:\nMappingControlToken: " << from_file; }
+    VISTA_CHECK_THROWS(vista::load_mapping_control_token(tree.root));
+    { vista::io::ofstream out(path); out << "MappingControlToken: invalid value\n"; }
+    VISTA_CHECK_THROWS(vista::load_mapping_control_token(tree.root));
 }
 
 VISTA_TEST(config_bootstrap_reports_unusable_destination_without_replacing_it) {
