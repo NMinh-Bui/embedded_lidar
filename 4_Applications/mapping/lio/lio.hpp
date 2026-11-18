@@ -31,6 +31,7 @@ struct LioConfig {
     double map_voxel_m{0.40};
     double local_radius_m{30.0};
     std::size_t local_max_points{50'000};
+    std::size_t scan_min_points{100}; // Unique scan voxels after the range filter.
     std::size_t scan_max_points{5'000};
     std::size_t initialization_samples{50};
     // Point-LIO IMU-as-output: these two values are measurement R, not process Q.

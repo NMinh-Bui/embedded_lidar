@@ -279,6 +279,8 @@ AppConfig parse_device_config_text(const std::string& contents) {
             config.lio.local_radius_m=parse_float(value,key);
         } else if (key == "liolocalmapmaxpoints") {
             config.lio.local_max_points=static_cast<std::size_t>(parse_unsigned(value,key,2'000'000));
+        } else if (key == "lioscanminpoints") {
+            config.lio.scan_min_points=static_cast<std::size_t>(parse_unsigned(value,"LioScanMinPoints",100'000));
         } else if (key == "lioscanmaxpoints") {
             config.lio.scan_max_points=static_cast<std::size_t>(parse_unsigned(value,key,100'000));
         } else if (key == "lioinitializationsamples") {

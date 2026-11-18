@@ -167,10 +167,12 @@ public:
         if(choices.size()>config.scan_max_points){
             for(std::size_t i=0;i<config.scan_max_points;++i)selected[choices[i*choices.size()/config.scan_max_points]]=true;
         }else for(auto i:choices)selected[i]=true;
-        if(choices.size()<100){
+        if(choices.size()<config.scan_min_points){
             matches=examined=0;residual=0;
-            if(last_accepted)return hold_geometry(scan,"insufficient scan geometry; selected="+std::to_string(choices.size())+"/100");
-            return reject("insufficient scan geometry");
+            const auto reason="insufficient scan geometry; selected="+std::to_string(choices.size())+
+                "/"+std::to_string(config.scan_min_points);
+            if(last_accepted)return hold_geometry(scan,reason);
+            return reject(reason);
         }
         if(holding && !hold_candidate_started){
             // Long unobserved IMU dead reckoning is NOT a new world anchor.

@@ -230,6 +230,14 @@ LioPlaneThresholdMeters: 0.08
             VISTA_CHECK_THROWS(vista::parse_device_config_text(std::string(quanergy_config)+"\n"+key+": "+value+"\n"));
 }
 
+VISTA_TEST(config_lio_minimum_scan_points_default_override_and_bounds) {
+    const std::string base=quanergy_config;
+    VISTA_CHECK(vista::parse_device_config_text(base).lio.scan_min_points==100);
+    VISTA_CHECK(vista::parse_device_config_text(base+"\nLioScanMinPoints: 80\n").lio.scan_min_points==80);
+    VISTA_CHECK_THROWS(vista::parse_device_config_text(base+"\nLioScanMinPoints: 29\n"));
+    VISTA_CHECK_THROWS(vista::parse_device_config_text(base+"\nLioScanMaxPoints: 100\nLioScanMinPoints: 101\n"));
+}
+
 VISTA_TEST(config_room_mapping_settings_and_independent_mounting) {
     const auto config=vista::parse_device_config_text(std::string(quanergy_config)+R"(
 MountZ(lidar): 2.5

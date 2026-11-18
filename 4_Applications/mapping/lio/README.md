@@ -90,6 +90,7 @@ fallback or algorithm-selection switch.
 | TXT setting | Point-LIO role | Default |
 |---|---|---:|
 | LioScanVoxelSizeMeters | Internal matching voxel, L2 launch preset | 0.4 m |
+| LioScanMinPoints | Minimum number of range-filtered scan voxels before attempting registration (30 to LioScanMaxPoints) | 100 |
 | LioMapVoxelSizeMeters | Internal odometry-map voxel, L2 launch preset | 0.4 m |
 | LioImuAccelerationCovariance | IMU acceleration measurement R | 0.1 |
 | LioImuGyroscopeCovariance | IMU angular-rate measurement R | 0.1 |
@@ -187,6 +188,13 @@ propagation. Neither trusted map is updated by a rejected scan. After a failure
 of an established pose, **three consecutive qualifying scans against the held
 local map** are required before map publication resumes. This is local recovery,
 not global relocalization. Large movement during loss may remain unrecoverable.
+
+Try `LioScanMinPoints: 80` when the diagnostic frequently reports
+`insufficient scan geometry; selected=…/100` and the scan has between 80 and 99
+selected voxels. This allows the scan to attempt registration. It still needs
+enough correspondences, observable geometry, acceptable residual and pose step,
+and three consistent recovery scans after HOLDING. Compare pose stability and
+RoomMap growth on the same scene before lowering the setting further.
 
 After an accepted pose exists, insufficient selected points/correspondences or
 degenerate LiDAR geometry enter **HOLDING** (wire code 5). Pose/orientation and

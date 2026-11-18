@@ -27,6 +27,8 @@ void validate_lio_config(const LioConfig& c) {
         c.initialization_samples < 20 || c.initialization_samples > 100'000 ||
         c.synchronization_timeout.count() <= 0 || c.synchronization_timeout.count() > 60'000)
         throw std::invalid_argument("invalid LIO budget, timing, or quality limit");
+    if (c.scan_min_points < 30 || c.scan_min_points > c.scan_max_points)
+        throw std::invalid_argument("LioScanMinPoints must be between 30 and LioScanMaxPoints");
 }
 LioSynchronizer::LioSynchronizer(double maximum_gap_s):maximum_gap_(maximum_gap_s) {}
 bool LioSynchronizer::add(TimedImu sample) {
