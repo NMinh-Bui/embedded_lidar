@@ -259,10 +259,12 @@ VISTA_TEST(gaussian_worker_and_websocket_use_full_map_checkpoint_and_clear_load_
 VISTA_TEST(gaussian_surface_mode_parser_preserves_legacy_and_rejects_invalid_modes) {
     const std::string view="VIEW 100 600 0 0 10 1 0 0 100 -1 0 0 100 0 1 0 100 0 -1 0 100 0 0 1 100 0 0 -1 100";
     using vista::application::parse_room_map_view_request;
-    VISTA_CHECK(!parse_room_map_view_request(view,100).edges_only);
-    VISTA_CHECK(!parse_room_map_view_request(view+" FULL",100).edges_only);
-    VISTA_CHECK(parse_room_map_view_request(view+" EDGES",100).edges_only);
-    VISTA_CHECK_THROWS(parse_room_map_view_request(view+" CORNERS",100));
+    using vista::models::GaussianSurfaceMode;
+    VISTA_CHECK(parse_room_map_view_request(view,100).surface_mode==GaussianSurfaceMode::full_surface);
+    VISTA_CHECK(parse_room_map_view_request(view+" FULL",100).surface_mode==GaussianSurfaceMode::full_surface);
+    VISTA_CHECK(parse_room_map_view_request(view+" EDGES",100).surface_mode==GaussianSurfaceMode::edges);
+    VISTA_CHECK(parse_room_map_view_request(view+" CORNERS",100).surface_mode==GaussianSurfaceMode::corners);
+    VISTA_CHECK_THROWS(parse_room_map_view_request(view+" POINTS",100));
     VISTA_CHECK_THROWS(parse_room_map_view_request(view+" EDGES extra",100));
 }
 
@@ -271,7 +273,13 @@ VISTA_TEST(gaussian_websocket_switches_modes_on_frozen_map_without_camera_cooldo
         std::array<double,6> bounds() const override {return {-10,-10,-10,10,10,10};}
         std::vector<vista::models::GaussianMapPoint> select_splats(const vista::models::RoomMapViewRequest& request) const override {
             vista::models::GaussianMapPoint point;point.center={1,2,3,77};point.covariance={.1F,0,0,.1F,0,.1F};
-            return std::vector<vista::models::GaussianMapPoint>(request.edges_only?1:3,point);
+            using vista::models::GaussianSurfaceMode;
+            switch(request.surface_mode) {
+                case GaussianSurfaceMode::edges: return {point,point};
+                case GaussianSurfaceMode::corners: return {point};
+                case GaussianSurfaceMode::full_surface: return {point,point,point};
+            }
+            return {};
         }
     };
     Runtime runtime;vista::platform::MessageBus bus;vista::platform::StopToken stop;
@@ -293,6 +301,11 @@ VISTA_TEST(gaussian_websocket_switches_modes_on_frozen_map_without_camera_cooldo
     const auto start=std::chrono::steady_clock::now();client.send_bytes(masked_text(view+" EDGES"));
     const auto metadata=client.read_frame();const std::string text(metadata.second.begin(),metadata.second.end());
     VISTA_CHECK(text.find("\"supportsEdges\":true")!=std::string::npos && text.find("\"surfaceMode\":\"edges\"")!=std::string::npos);
+    VISTA_CHECK(client.read_frame().second.size()==32+2*44);
+    client.send_bytes(masked_text(view+" CORNERS"));
+    const auto corner_metadata=client.read_frame();
+    const std::string corner_text(corner_metadata.second.begin(),corner_metadata.second.end());
+    VISTA_CHECK(corner_text.find("\"supportsCorners\":true")!=std::string::npos && corner_text.find("\"surfaceMode\":\"corners\"")!=std::string::npos);
     VISTA_CHECK(client.read_frame().second.size()==32+44);
     client.send_bytes(masked_text(view));
     VISTA_CHECK(client.read_frame().first==1);VISTA_CHECK(client.read_frame().second.size()==32+3*44);

@@ -10,6 +10,7 @@
 
 namespace {
 using Store=vista::transport::RoomMapTileStore;
+using vista::models::GaussianSurfaceMode;
 std::unique_ptr<Store> store() {
     auto s=std::make_unique<Store>(vista::fs::path{},.1F,.4F,1000,8,2,2);
     s->enable_surface_snapshots(true);return s;
@@ -186,7 +187,7 @@ VISTA_TEST(gaussian_edges_remove_flat_interiors_without_tile_seams_and_keep_boun
     const auto view=builder.update(*snapshot);
     vista::models::RoomMapViewRequest request;request.point_budget=2000;
     const auto full=view->select_splats(request);VISTA_CHECK(full.size()==626);
-    request.edges_only=true;const auto edges=view->select_splats(request);
+    request.surface_mode=GaussianSurfaceMode::edges;const auto edges=view->select_splats(request);
     VISTA_CHECK(edges.size()>20 && edges.size()<full.size()/2);
     for(const auto& point:edges) {
         VISTA_CHECK(std::abs(point.center.x)>.9F || std::abs(point.center.y)>.9F);
@@ -195,7 +196,7 @@ VISTA_TEST(gaussian_edges_remove_flat_interiors_without_tile_seams_and_keep_boun
     const auto built=builder.rebuilt_tiles();request.point_budget=7;
     VISTA_CHECK(view->select_splats(request).size()==7);
     VISTA_CHECK(builder.rebuilt_tiles()==built);
-    request.edges_only=false;request.point_budget=2000;
+    request.surface_mode=GaussianSurfaceMode::full_surface;request.point_budget=2000;
     const auto restored=view->select_splats(request);VISTA_CHECK(restored.size()==full.size());
     for(std::size_t i=0;i<full.size();++i) VISTA_CHECK(restored[i].center==full[i].center && restored[i].covariance==full[i].covariance);
 }
@@ -206,7 +207,7 @@ VISTA_TEST(gaussian_edges_keep_supported_creases_and_rebuild_after_neighbor_dele
     for(int z=1;z<=16;++z) for(int y=-10;y<=10;++y) add(*s,0,y,z);
     vista::application::GaussianMapBuilder builder;
     const auto first=builder.update(*s->view_source(1)->surface_snapshot());
-    vista::models::RoomMapViewRequest request;request.point_budget=2000;request.edges_only=true;
+    vista::models::RoomMapViewRequest request;request.point_budget=2000;request.surface_mode=GaussianSurfaceMode::edges;
     const auto old=first->select_splats(request);unsigned crease{};
     for(const auto& p:old) if(p.center.x<.2F && p.center.z<.2F && std::abs(p.center.y)<.5F) ++crease;
     VISTA_CHECK(crease>=8);
@@ -218,6 +219,37 @@ VISTA_TEST(gaussian_edges_keep_supported_creases_and_rebuild_after_neighbor_dele
     for(std::size_t i=0;i<actual.size();++i) VISTA_CHECK(actual[i].center==expected[i].center && actual[i].covariance==expected[i].covariance);
     VISTA_CHECK(first->select_splats(request).size()==old.size());
     auto empty=*source;empty.regions.clear();VISTA_CHECK(builder.update(empty)->select_splats(request).empty());
+}
+
+VISTA_TEST(gaussian_corners_require_three_faces_and_keep_one_vertex_across_tiles) {
+    auto s=store();
+    // A room-like concave vertex and its faces straddle several tile boundaries.
+    for(int a=0;a<=10;++a) for(int b=0;b<=10;++b) {
+        add(*s,3+a,-4+b,0);
+        if(b>0) add(*s,3+a,-4,b);
+        if(a>0 && b>0) add(*s,3,-4+a,b);
+    }
+    vista::application::GaussianMapBuilder builder;
+    const auto first=builder.update(*s->view_source(1)->surface_snapshot());
+    vista::models::RoomMapViewRequest request;
+    request.surface_mode=GaussianSurfaceMode::corners;
+    const auto corners=first->select_splats(request);
+    VISTA_CHECK(corners.size()==1);
+    VISTA_CHECK_NEAR(corners[0].center.x,.325F,.11F);
+    VISTA_CHECK_NEAR(corners[0].center.y,-.375F,.11F);
+    VISTA_CHECK_NEAR(corners[0].center.z,.025F,.11F);
+    request.has_camera=true;
+    request.planes[0]={1,0,0,-1.2};
+    VISTA_CHECK(first->select_splats(request).empty());
+    request.has_camera=false;
+
+    // Remove the third face. The surviving crease still appears in Edges.
+    for(int a=1;a<=10;++a) for(int b=1;b<=10;++b) s->erase({3,-4+a,b});
+    const auto next=builder.update(*s->view_source(2)->surface_snapshot());
+    VISTA_CHECK(next->select_splats(request).empty());
+    VISTA_CHECK(first->select_splats(request).size()==1);
+    request.surface_mode=GaussianSurfaceMode::edges;
+    VISTA_CHECK(!next->select_splats(request).empty());
 }
 
 VISTA_TEST(gaussian_optional_real_pcd_fixture) {
@@ -235,8 +267,12 @@ VISTA_TEST(gaussian_optional_real_pcd_fixture) {
     std::cout<<"Gaussian real PCD: "<<map.status().point_count<<" source points, "<<points.size()
         <<" visible splats, "<<builder.rebuilt_tiles()<<" tiles, "
         <<std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()<<" s (load + fit + view)\n";
-    request.edges_only=true;const auto edges=view->select_splats(request);
+    request.surface_mode=GaussianSurfaceMode::edges;const auto edges=view->select_splats(request);
     VISTA_CHECK(edges.size()<=request.point_budget);
     std::cout<<"Gaussian real PCD edges: "<<edges.size()<<" visible splats, "
         <<vista::application::encode_gaussian_map(edges,1,1).size()<<" bytes\n";
+    request.surface_mode=GaussianSurfaceMode::corners;
+    const auto corners=view->select_splats(request);
+    VISTA_CHECK(corners.size()<=request.point_budget);
+    std::cout<<"Gaussian real PCD corners: "<<corners.size()<<" visible splats\n";
 }

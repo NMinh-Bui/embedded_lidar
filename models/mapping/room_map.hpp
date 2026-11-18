@@ -71,6 +71,8 @@ struct RoomMapStatus {
 };
 
 /// A bounded, camera-specific rendering request. Planes face into the frustum.
+enum class GaussianSurfaceMode { full_surface, edges, corners };
+
 struct RoomMapViewRequest {
     std::size_t point_budget{250'000};
     double viewport_height{600};
@@ -78,7 +80,7 @@ struct RoomMapViewRequest {
     std::array<std::array<double,4>,6> planes{};
     bool has_camera{false};
     // Gaussian rendering only; the complete RoomMap geometry is unchanged.
-    bool edges_only{false};
+    GaussianSurfaceMode surface_mode{GaussianSurfaceMode::full_surface};
 };
 /// Workers share a disk reader, NOT a full-map copy. Disk queries are serialized
 /// with page replacement, but never hold the live accumulator update mutex.
