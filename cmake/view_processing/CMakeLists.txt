@@ -7,6 +7,7 @@ if(MSVC)
 endif()
 add_library(vista_view_processing OBJECT
     "${PROJECT_SOURCE_DIR}/4_Applications/mapping/gaussian_map/gaussian_map.cpp"
+    "${PROJECT_SOURCE_DIR}/4_Applications/mapping/gaussian_map/room_layout.cpp"
     "${PROJECT_SOURCE_DIR}/4_Applications/perception/foreground/foreground.cpp")
 target_link_libraries(vista_view_processing PRIVATE vista_edge_dependencies)
 vista_enable_warnings(vista_view_processing)

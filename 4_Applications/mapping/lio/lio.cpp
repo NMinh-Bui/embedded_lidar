@@ -283,7 +283,7 @@ platform::WorkerHandle spawn_lio_worker(platform::MessageBus& bus,
                     if(const auto integrated=engine->propagation_time_s())sync.retain_from(*integrated);
                     if (output.world_cloud) {
                         if (latest.pose_valid && latest.state==models::LocalizationState::tracking)
-                            accepted_pose=models::LidarPose{latest.position_m,latest.orientation_xyzw};
+                            accepted_pose=models::LidarPose{latest.position_m,latest.orientation_xyzw,latest.world_up};
                         publish_world(*p.message, std::move(*output.world_cloud));
                     }
                     else ++report.rejected;

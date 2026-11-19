@@ -248,6 +248,9 @@ void run_capture(AppConfig active, std::string device_text, const std::optional<
         });
         workers.start<GaussianMapReport>(Task::gaussian,t.gaussian_mapping,[&](auto thread,auto s,auto done) {
             auto gaussian = config.gaussian_map;
+            gaussian.layout.lidar_position = config.lio.initial_position_m;
+            if (config.mounting && config.mounting->mount_z_m>0)
+                gaussian.layout.floor_datum = models::RoomLayoutPosition{0,0,0};
             if (!config.room_map.storage_directory.empty()) {
                 gaussian.storage_directory = config.room_map.storage_directory;
                 gaussian.storage_directory += ".gaussian";

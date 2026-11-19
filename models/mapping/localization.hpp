@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace vista::models {
@@ -19,5 +20,6 @@ struct LocalizationStatus {
     bool pose_valid{};
     std::string reason;
     std::uint64_t mapping_generation{};
+    std::optional<std::array<double,3>> world_up{};
 };
 } // namespace vista::models

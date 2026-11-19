@@ -1,5 +1,6 @@
 #pragma once
 #include "models/mapping/room_map.hpp"
+#include "models/mapping/room_layout.hpp"
 
 namespace vista::models {
 /// Geometric intensity surfel, NOT a camera-trained/photometric 3DGS model.
@@ -11,6 +12,7 @@ struct GaussianMapPoint {
 };
 class GaussianMapViewSource : public RoomMapViewSource {
 public:
+    virtual const RoomLayout* room_layout() const { return nullptr; }
     virtual std::vector<GaussianMapPoint> select_splats(const RoomMapViewRequest&) const = 0;
     RoomMapFrame select_view(const RoomMapViewRequest& request) const final {
         RoomMapFrame frame;

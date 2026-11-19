@@ -557,9 +557,7 @@ VISTA_TEST(gaussian_surface_mode_parser_preserves_legacy_and_rejects_invalid_mod
     VISTA_CHECK(parse_room_map_view_request(view+" FULL",100).surface_mode==GaussianSurfaceMode::full_surface);
     VISTA_CHECK(parse_room_map_view_request(view+" EDGES",100).surface_mode==GaussianSurfaceMode::edges);
     VISTA_CHECK(parse_room_map_view_request(view+" CORNERS",100).surface_mode==GaussianSurfaceMode::corners);
-    VISTA_CHECK(!parse_room_map_view_request(view+" CORNERS",100).gaussian_corner_radius_m);
-    VISTA_CHECK(parse_room_map_view_request(view+" CORNERS 1.5",100).gaussian_corner_radius_m==1.5);
-    VISTA_CHECK(parse_room_map_view_request(view+" CORNERS 0",100).gaussian_corner_radius_m==0.0);
+    VISTA_CHECK(parse_room_map_view_request(view+" CORNERS 1.5",100).surface_mode==GaussianSurfaceMode::corners);
     VISTA_CHECK_THROWS(parse_room_map_view_request(view+" CORNERS -0.1",100));
     VISTA_CHECK_THROWS(parse_room_map_view_request(view+" CORNERS 4",100));
     VISTA_CHECK_THROWS(parse_room_map_view_request(view+" CORNERS 1.5extra",100));
@@ -569,16 +567,18 @@ VISTA_TEST(gaussian_surface_mode_parser_preserves_legacy_and_rejects_invalid_mod
 
 VISTA_TEST(gaussian_websocket_switches_modes_on_frozen_map_without_camera_cooldown_or_cross_client_effects) {
     struct Source final : vista::models::GaussianMapViewSource {
+        vista::models::RoomLayout geometry{
+            {{{1,2,3},false},{{4,2,3},true}},
+            {{{1,2,3},{4,2,3},false},{{4,2,3},{4,2,0},true}},
+            vista::models::RoomLayoutFloor::estimated,false};
+        const vista::models::RoomLayout* room_layout() const override { return &geometry; }
         std::array<double,6> bounds() const override {return {-10,-10,-10,10,10,10};}
         std::vector<vista::models::GaussianMapPoint> select_splats(const vista::models::RoomMapViewRequest& request) const override {
             vista::models::GaussianMapPoint point;point.center={1,2,3,77};point.covariance={.1F,0,0,.1F,0,.1F};
             using vista::models::GaussianSurfaceMode;
             switch(request.surface_mode) {
                 case GaussianSurfaceMode::edges: return {point,point};
-                case GaussianSurfaceMode::corners:
-                    return request.gaussian_corner_radius_m.value_or(0)>1.5 ?
-                        std::vector<vista::models::GaussianMapPoint>{point,point} :
-                        std::vector<vista::models::GaussianMapPoint>{point};
+                case GaussianSurfaceMode::corners: throw std::logic_error("layout must not request splats");
                 case GaussianSurfaceMode::full_surface: return {point,point,point};
             }
             return {};
@@ -588,7 +588,6 @@ VISTA_TEST(gaussian_websocket_switches_modes_on_frozen_map_without_camera_cooldo
     auto publisher=bus.publisher<vista::models::RoomMapViewMessage>(vista::models::topics::gaussian_map_view);
     vista::application::PointCloudWebSocketConfig config;config.gaussian_map=true;config.room_map_lod=true;
     config.port=available_port();config.publish_interval=10s;config.maximum_points=10;
-    config.gaussian_corner_radius_m=1.25;
     std::string failure;
     auto worker=vista::application::spawn_pointcloud_websocket(bus,{"test-edge-mode",4},stop,config,
         [&](auto,auto error){failure=std::move(error);});
@@ -608,15 +607,12 @@ VISTA_TEST(gaussian_websocket_switches_modes_on_frozen_map_without_camera_cooldo
     client.send_bytes(masked_text(view+" CORNERS"));
     const auto corner_metadata=client.read_frame();
     const std::string corner_text(corner_metadata.second.begin(),corner_metadata.second.end());
-    VISTA_CHECK(corner_text.find("\"supportsCorners\":true")!=std::string::npos && corner_text.find("\"surfaceMode\":\"corners\"")!=std::string::npos);
-    VISTA_CHECK(corner_text.find("\"defaultCornerRadiusMeters\":1.25")!=std::string::npos);
-    VISTA_CHECK(corner_text.find("\"cornerRadiusMeters\":1.25")!=std::string::npos);
-    VISTA_CHECK(client.read_frame().second.size()==32+44);
+    VISTA_CHECK(corner_text.find("\"supportsRoomLayout\":true")!=std::string::npos &&
+        corner_text.find("\"surfaceMode\":\"corners\"")!=std::string::npos);
+    VISTA_CHECK(corner_text.find(R"("floor":"estimated")")!=std::string::npos);
+    VISTA_CHECK(corner_text.find(R"("segments":[[1,2,3,4,2,3,false],[4,2,3,4,2,0,true]])")!=std::string::npos);
+    VISTA_CHECK(client.read_frame().second.size()==32); // Structural data is compact metadata.
     client.send_bytes(masked_text(view+" CORNERS 2"));
-    const auto wider_metadata=client.read_frame();
-    const std::string wider_text(wider_metadata.second.begin(),wider_metadata.second.end());
-    VISTA_CHECK(wider_text.find("\"cornerRadiusMeters\":2")!=std::string::npos);
-    VISTA_CHECK(client.read_frame().second.size()==32+2*44);
     client.send_bytes(masked_text(view));
     VISTA_CHECK(client.read_frame().first==1);VISTA_CHECK(client.read_frame().second.size()==32+3*44);
     VISTA_CHECK(std::chrono::steady_clock::now()-start<2s);

@@ -127,8 +127,6 @@ RoomMapWebSocketRetryIntervalSeconds: 2
 # Shares RoomMapPublishIntervalMilliseconds, MaxClients and RetryIntervalSeconds.
 # No camera training/clustering; 0 disables this optional mapping branch.
 GaussianMapEnabled: 1
-# Corners shows nearby edge points within this 3D radius (0-3 m; 0 shows markers alone).
-GaussianMapCornerRadiusMeters: 1.5
 GaussianMapWebSocketBindAddress: 127.0.0.1
 GaussianMapWebSocketPort: 8767
 GaussianMapWebSocketMaxPoints: 100000

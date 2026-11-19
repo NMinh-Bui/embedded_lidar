@@ -73,8 +73,6 @@ struct RoomMapStatus {
 
 /// A bounded, camera-specific rendering request. Planes face into the frustum.
 enum class GaussianSurfaceMode { full_surface, edges, corners };
-inline constexpr double default_gaussian_corner_radius_m = 1.5;
-inline constexpr double maximum_gaussian_corner_radius_m = 3.0;
 
 struct RoomMapViewRequest {
     std::size_t point_budget{250'000};
@@ -84,9 +82,6 @@ struct RoomMapViewRequest {
     bool has_camera{false};
     // Gaussian rendering only; the complete RoomMap geometry is unchanged.
     GaussianSurfaceMode surface_mode{GaussianSurfaceMode::full_surface};
-    // Absent in internal requests means vertex markers alone. The Gaussian
-    // WebSocket applies the configured default to an omitted client radius.
-    std::optional<double> gaussian_corner_radius_m;
 };
 /// Workers share a disk reader, NOT a full-map copy. Disk queries are serialized
 /// with page replacement, but never hold the live accumulator update mutex.

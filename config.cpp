@@ -413,7 +413,10 @@ AppConfig parse_device_config_text(const std::string& contents) {
         } else if (key == "gaussianmapenabled") {
             config.gaussian_map.enabled=parse_boolean(value,"GaussianMapEnabled");
         } else if (key == "gaussianmapcornerradiusmeters") {
-            config.gaussian_map_websocket.gaussian_corner_radius_m = parse_float(value,"GaussianMapCornerRadiusMeters");
+            // Accept the retired visual radius in existing deployments.
+            const auto legacy_radius = parse_float(value,"GaussianMapCornerRadiusMeters");
+            if (!std::isfinite(legacy_radius) || legacy_radius<0 || legacy_radius>3)
+                throw std::invalid_argument("GaussianMapCornerRadiusMeters must be between 0 and 3 m");
         } else if (key == "gaussianmapwebsocketbindaddress") {
             config.gaussian_map_websocket.bind_address=value;
         } else if (key == "gaussianmapwebsocketport") {

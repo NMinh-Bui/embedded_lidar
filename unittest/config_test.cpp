@@ -43,11 +43,9 @@ std::string read_config_test_file(const vista::fs::path& file) {
 
 }  // namespace
 
-VISTA_TEST(gaussian_corner_radius_config_defaults_and_rejects_out_of_range) {
+VISTA_TEST(gaussian_corner_radius_config_accepts_old_deployments) {
     const std::string source=quanergy_config;
-    VISTA_CHECK(vista::parse_device_config_text(source).gaussian_map_websocket.gaussian_corner_radius_m==1.5);
-    VISTA_CHECK(vista::parse_device_config_text(source+"\nGaussianMapCornerRadiusMeters: 1.75\n")
-        .gaussian_map_websocket.gaussian_corner_radius_m==1.75);
+    (void)vista::parse_device_config_text(source+"\nGaussianMapCornerRadiusMeters: 1.75\n");
     VISTA_CHECK_THROWS(vista::parse_device_config_text(source+"\nGaussianMapCornerRadiusMeters: 3.1\n"));
 }
 

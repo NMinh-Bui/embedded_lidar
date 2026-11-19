@@ -3,10 +3,15 @@
 #include "1_Platform/message_bus/message_bus.hpp"
 #include "1_Platform/threading/threading.hpp"
 #include "models/mapping/gaussian_map.hpp"
+#include "4_Applications/mapping/gaussian_map/room_layout.hpp"
 #include <functional>
 #include <optional>
 namespace vista::application {
-struct GaussianMapConfig { bool enabled{true}; vista::fs::path storage_directory; };
+struct GaussianMapConfig {
+    bool enabled{true};
+    vista::fs::path storage_directory;
+    RoomLayoutReference layout;
+};
 struct GaussianMapReport {
     std::uint64_t received_maps{},completed_revisions{},rebuilt_tiles{},failed_revisions{};
 };
@@ -16,7 +21,8 @@ public:
     explicit GaussianMapBuilder(vista::fs::path storage_directory = {});
     ~GaussianMapBuilder();
     std::shared_ptr<const models::GaussianMapViewSource> update(
-        const models::RoomMapSurfaceSnapshot&,const std::function<bool()>& cancelled = {});
+        const models::RoomMapSurfaceSnapshot&,const std::function<bool()>& cancelled = {},
+        const std::optional<RoomLayoutReference>& layout = std::nullopt);
     std::uint64_t rebuilt_tiles() const;
 private:
     class Impl;std::unique_ptr<Impl> impl_;

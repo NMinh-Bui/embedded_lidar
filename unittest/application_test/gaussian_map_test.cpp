@@ -221,62 +221,105 @@ VISTA_TEST(gaussian_edges_keep_supported_creases_and_rebuild_after_neighbor_dele
     auto empty=*source;empty.regions.clear();VISTA_CHECK(builder.update(empty)->select_splats(request).empty());
 }
 
-VISTA_TEST(gaussian_corners_require_three_faces_and_keep_one_vertex_across_tiles) {
-    auto s=store();
-    // A room-like concave vertex and its faces straddle several tile boundaries.
-    for(int a=0;a<=10;++a) for(int b=0;b<=10;++b) {
-        add(*s,3+a,-4+b,0);
-        if(b>0) add(*s,3+a,-4,b);
-        if(a>0 && b>0) add(*s,3,-4+a,b);
+namespace {
+using vista::application::RoomLayoutSample;
+
+std::vector<RoomLayoutSample> room_layout_samples(bool west, bool floor, bool hidden_corner = false) {
+    std::vector<RoomLayoutSample> points;
+    for (int along=-15; along<=15; ++along) for (int h=2; h<=22; ++h) {
+        const auto a=along*.1F, z=h*.1F;
+        if (!hidden_corner || along<5) points.push_back({{1.5F,a,z},{1,0,0}});
+        if (!hidden_corner || along<5) points.push_back({{a,1.5F,z},{0,1,0}});
+        points.push_back({{a,-1.5F,z},{0,1,0}});
+        if (west) points.push_back({{-1.5F,a,z},{1,0,0}});
+    }
+    for (int x=-14; x<=14; ++x) for (int y=-14; y<=14; ++y) {
+        points.push_back({{x*.1F,y*.1F,2.3F},{0,0,1}});
+        if (floor) points.push_back({{x*.1F,y*.1F,0},{0,0,1}});
+    }
+    // A monitor-sized vertical patch inside the room should not become a wall.
+    for (int y=-3; y<=3; ++y) for (int h=6; h<=10; ++h)
+        points.push_back({{.5F,y*.1F,h*.1F},{1,0,0}});
+    return points;
+}
+}
+VISTA_TEST(gaussian_room_layout_fits_room_walls_and_projects_along_gravity) {
+    auto points=room_layout_samples(true,true);
+    // Rotate the room and gravity in world coordinates. The floor is tilted
+    // relative to world Z, so a hardcoded vertical axis gives wrong feet.
+    constexpr double a=.24;
+    const auto rotate=[a](const std::array<float,3>& p) {
+        return std::array<float,3>{p[0],static_cast<float>(p[1]*std::cos(a)-p[2]*std::sin(a)),
+            static_cast<float>(p[1]*std::sin(a)+p[2]*std::cos(a))};
+    };
+    for (auto& p : points) {p.position=rotate(p.position);p.normal=rotate(p.normal);}
+    vista::application::RoomLayoutReference reference;
+    reference.lidar_position={0,-.7*std::sin(a),.7*std::cos(a)};
+    reference.world_up={0,-std::sin(a),std::cos(a)};
+    const auto layout=vista::application::estimate_room_layout(points,reference,.05);
+    VISTA_CHECK(layout.closed && layout.corners.size()==4);
+    VISTA_CHECK(layout.floor==vista::models::RoomLayoutFloor::measured);
+    std::size_t feet=0;
+    for (const auto& segment : layout.segments) {
+        const auto height=[&](const auto& p) {return -p[1]*std::sin(a)+p[2]*std::cos(a);};
+        if (std::abs(height(segment.start))>.03 || height(segment.end)<.12) continue;
+        VISTA_CHECK_NEAR(segment.start[0],segment.end[0],1e-6);
+        const auto dy=segment.end[1]-segment.start[1], dz=segment.end[2]-segment.start[2];
+        VISTA_CHECK_NEAR(dy*std::cos(a)+dz*std::sin(a),0,1e-6);
+        ++feet;
+    }
+    VISTA_CHECK(feet==4);
+}
+VISTA_TEST(gaussian_room_layout_keeps_open_room_and_labels_estimated_floor) {
+    vista::application::RoomLayoutReference reference;
+    reference.lidar_position={0,0,.7};
+    reference.floor_datum=vista::models::RoomLayoutPosition{0,0,0};
+    const auto layout=vista::application::estimate_room_layout(room_layout_samples(false,false),reference,.05);
+    VISTA_CHECK(!layout.closed && layout.corners.size()==2);
+    VISTA_CHECK(layout.floor==vista::models::RoomLayoutFloor::estimated);
+    for (const auto& segment : layout.segments)
+        if (std::min(segment.start[2],segment.end[2])==0) VISTA_CHECK(segment.inferred);
+    reference.floor_datum.reset();
+    const auto unknown=vista::application::estimate_room_layout(room_layout_samples(false,false),reference,.05);
+    VISTA_CHECK(unknown.floor==vista::models::RoomLayoutFloor::unknown && unknown.corners.size()==2);
+    for (const auto& segment : unknown.segments)
+        VISTA_CHECK(segment.start[2]>1 && segment.end[2]>1);
+}
+VISTA_TEST(gaussian_room_layout_extrapolates_fourth_supported_wall_intersection_as_inferred) {
+    vista::application::RoomLayoutReference reference;
+    reference.lidar_position={0,0,.7};
+    const auto layout=vista::application::estimate_room_layout(room_layout_samples(true,true,true),reference,.05);
+    VISTA_CHECK(layout.closed && layout.corners.size()==4);
+    std::size_t inferred=0;
+    for (const auto& corner : layout.corners) {
+        if (!corner.inferred) continue;
+        VISTA_CHECK(corner.position[0]>1 && corner.position[1]>1);
+        ++inferred;
+    }
+    VISTA_CHECK(inferred==1);
+}
+VISTA_TEST(gaussian_room_layout_reuses_planar_cache_and_replaces_removed_walls) {
+    auto cache=std::make_unique<Store>(vista::fs::path{},.1F,2.F,20000,32,2,2);
+    cache->enable_surface_snapshots(true);
+    for (int along=-15; along<=15; ++along) for (int h=1; h<=24; ++h) {
+        add(*cache,15,along,h);add(*cache,-15,along,h);
+        add(*cache,along,15,h);add(*cache,along,-15,h);
+    }
+    for (int x=-15; x<=15; ++x) for (int y=-15; y<=15; ++y) {
+        add(*cache,x,y,0);add(*cache,x,y,25);
     }
     vista::application::GaussianMapBuilder builder;
-    const auto first=builder.update(*s->view_source(1)->surface_snapshot());
-    vista::models::RoomMapViewRequest request;
-    request.surface_mode=GaussianSurfaceMode::corners;
-    const auto corners=first->select_splats(request);
-    VISTA_CHECK(corners.size()==1);
-    VISTA_CHECK_NEAR(corners[0].center.x,.325F,.11F);
-    VISTA_CHECK_NEAR(corners[0].center.y,-.375F,.11F);
-    VISTA_CHECK_NEAR(corners[0].center.z,.025F,.11F);
-    const auto rebuilt=builder.rebuilt_tiles();
-    request.gaussian_corner_radius_m=.35;
-    const auto near=first->select_splats(request);
-    VISTA_CHECK(near.size()>corners.size());
-    VISTA_CHECK(near.front().center==corners.front().center);
-    bool different_tile=false;
-    for (std::size_t i=1;i<near.size();++i) {
-        const auto& edge=near[i].center;
-        const auto& center=corners.front().center;
-        const double x=edge.x-center.x,y=edge.y-center.y,z=edge.z-center.z;
-        VISTA_CHECK(x*x+y*y+z*z<=.35*.35+1e-6);
-        VISTA_CHECK(!(edge==center));
-        different_tile=different_tile || std::floor(edge.x/.4F)!=std::floor(center.x/.4F) ||
-            std::floor(edge.y/.4F)!=std::floor(center.y/.4F) || std::floor(edge.z/.4F)!=std::floor(center.z/.4F);
-    }
-    VISTA_CHECK(different_tile);
-    request.gaussian_corner_radius_m=.90;
-    VISTA_CHECK(first->select_splats(request).size()>near.size());
-    request.point_budget=1;
-    const auto one=first->select_splats(request);
-    VISTA_CHECK(one.size()==1 && one.front().center==corners.front().center);
-    VISTA_CHECK(builder.rebuilt_tiles()==rebuilt);
-    request.point_budget=250'000;
-    request.gaussian_corner_radius_m.reset();
-    request.has_camera=true;
-    request.planes[0]={1,0,0,-1.2};
-    VISTA_CHECK(first->select_splats(request).empty());
-    request.has_camera=false;
-
-    // Remove the third face. The surviving crease still appears in Edges.
-    for(int a=1;a<=10;++a) for(int b=1;b<=10;++b) s->erase({3,-4+a,b});
-    const auto next=builder.update(*s->view_source(2)->surface_snapshot());
-    VISTA_CHECK(next->select_splats(request).empty());
-    VISTA_CHECK(first->select_splats(request).size()==1);
-    request.gaussian_corner_radius_m=.35;
-    VISTA_CHECK(next->select_splats(request).empty());
-    VISTA_CHECK(first->select_splats(request).size()==near.size());
-    request.surface_mode=GaussianSurfaceMode::edges;
-    VISTA_CHECK(!next->select_splats(request).empty());
+    vista::application::RoomLayoutReference reference;
+    reference.lidar_position={0,0,.7};
+    const auto first=builder.update(*cache->view_source(1)->surface_snapshot(),{},reference);
+    VISTA_CHECK(first->room_layout()->closed && first->room_layout()->corners.size()==4);
+    vista::models::RoomMapViewRequest view;
+    view.surface_mode=GaussianSurfaceMode::corners;
+    VISTA_CHECK(first->select_splats(view).empty());
+    for (int along=-14; along<=14; ++along) for (int h=1; h<=24; ++h) cache->erase({-15,along,h});
+    const auto second=builder.update(*cache->view_source(2)->surface_snapshot(),{},reference);
+    VISTA_CHECK(!second->room_layout()->closed && second->room_layout()->corners.size()==2);
+    VISTA_CHECK(first->room_layout()->closed && first->room_layout()->corners.size()==4);
 }
 
 VISTA_TEST(gaussian_optional_real_pcd_fixture) {
@@ -286,7 +329,10 @@ VISTA_TEST(gaussian_optional_real_pcd_fixture) {
     const auto started=std::chrono::steady_clock::now();map.load(path);
     auto snapshot=map.view_source()->surface_snapshot();
     vista::application::GaussianMapBuilder builder;
-    auto view=builder.update(*snapshot);
+    vista::application::RoomLayoutReference reference;
+    reference.lidar_position={0,0,.7};
+    reference.floor_datum=vista::models::RoomLayoutPosition{0,0,0};
+    auto view=builder.update(*snapshot,{},reference);
     vista::models::RoomMapViewRequest request;request.point_budget=100000;
     const auto points=view->select_splats(request);
     VISTA_CHECK(!points.empty() && points.size()<=request.point_budget);
@@ -299,7 +345,9 @@ VISTA_TEST(gaussian_optional_real_pcd_fixture) {
     std::cout<<"Gaussian real PCD edges: "<<edges.size()<<" visible splats, "
         <<vista::application::encode_gaussian_map(edges,1,1).size()<<" bytes\n";
     request.surface_mode=GaussianSurfaceMode::corners;
-    const auto corners=view->select_splats(request);
-    VISTA_CHECK(corners.size()<=request.point_budget);
-    std::cout<<"Gaussian real PCD corners: "<<corners.size()<<" visible splats\n";
+    VISTA_CHECK(view->select_splats(request).empty());
+    const auto& layout=*view->room_layout();
+    VISTA_CHECK(layout.corners.size()<=8 && layout.segments.size()<=96);
+    std::cout<<"Gaussian real PCD layout: "<<layout.corners.size()<<" corners, "
+        <<layout.segments.size()<<" segments, closed="<<layout.closed<<'\n';
 }

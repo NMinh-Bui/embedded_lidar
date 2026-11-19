@@ -470,6 +470,10 @@ private:
     models::LocalizationStatus diagnostic(models::LocalizationState state,std::string reason) const{
         models::LocalizationStatus d;d.state=state;d.reason=std::move(reason);d.local_map_points=local_points.size();d.rejected_scans=rejected;
         const auto s=last_accepted.value_or(initial_anchor);const Vec origin=s.pos+s.rot.normalized()*s.offset_T_L_I;const Eigen::Quaterniond q(s.rot.normalized().toRotationMatrix()*s.offset_R_L_I.normalized().toRotationMatrix());
+        if (last_accepted && s.gravity.allFinite() && s.gravity.norm()>0) {
+            const Vec up = -s.gravity.normalized();
+            d.world_up = std::array<double,3>{up.x(),up.y(),up.z()};
+        }
         d.position_m={origin.x(),origin.y(),origin.z()};d.orientation_xyzw={q.x(),q.y(),q.z(),q.w()};d.match_ratio=examined?static_cast<double>(matches)/examined:0;d.residual_m=residual;d.position_variance=filter.get_P().block<3,3>(0,0).trace();return d;
     }
     LioOutput reject(std::string reason,bool lost=false){

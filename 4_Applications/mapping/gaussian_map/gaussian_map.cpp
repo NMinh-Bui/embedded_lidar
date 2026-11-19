@@ -1,6 +1,7 @@
 #include "4_Applications/mapping/gaussian_map/gaussian_map.hpp"
 #include "2_Transport/storage/room_map_tiles.hpp"
 #include "2_Transport/storage/session_directory.hpp"
+#include "models/mapping/lidar_pose.hpp"
 #include "models/topics.hpp"
 #include <algorithm>
 #include <atomic>
@@ -9,7 +10,8 @@
 #include <iostream>
 #include <limits>
 #include <set>
-#include <tuple>
+#include <iterator>
+#include <unordered_set>
 #include <unordered_map>
 namespace vista::application {
 namespace {
@@ -19,9 +21,9 @@ using Voxel=transport::MapVoxelKey;
 using Cells=std::unordered_map<Voxel,models::RoomMapPoint,transport::MapVoxelHash>;
 using Vec3=std::array<double,3>;
 constexpr int surface_radius_cells=3;
-constexpr int corner_radius_cells=5;
-constexpr int suppression_radius_cells=3;
-constexpr int tile_halo_cells=surface_radius_cells+corner_radius_cells+suppression_radius_cells;
+constexpr int tile_halo_cells=surface_radius_cells;
+constexpr std::size_t layout_samples_per_tile=192;
+constexpr std::size_t layout_tile_limit=96;
 constexpr int max_lookup_side=88; // Up to 65 source voxels per tile plus both halos and rounding.
 constexpr std::uint64_t record_bytes=41;
 
@@ -29,13 +31,6 @@ double dot(const Vec3& a,const Vec3& b) {
     return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
 }
 
-Vec3 cross(const Vec3& a,const Vec3& b) {
-    return {a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]};
-}
-
-Vec3 displacement(const models::RoomMapPoint& from,const models::RoomMapPoint& to) {
-    return {static_cast<double>(to.x)-from.x,static_cast<double>(to.y)-from.y,static_cast<double>(to.z)-from.z};
-}
 void write_point(std::ostream& out,const Point& p) {
     std::array<char,41> record{};
     std::memcpy(record.data(),&p.center.x,4);std::memcpy(record.data()+4,&p.center.y,4);
@@ -113,7 +108,6 @@ public:
 struct SurfaceEvidence {
     Vec3 normal{};
     bool planar{};
-    bool corner_candidate{};
 };
 
 Point fit(const models::RoomMapPoint& center,const DenseCells& cells,float size,
@@ -140,7 +134,7 @@ Point fit(const models::RoomMapPoint& center,const DenseCells& cells,float size,
     bool planar{};std::array<double,3> eigenvalues{};
     const auto n=normal(moments,planar,size,eigenvalues);
     const auto trace=eigenvalues[0]+eigenvalues[1]+eigenvalues[2];
-    evidence={n,planar,!planar && count>=8 && eigenvalues[0]>size*size*.025 && eigenvalues[0]>=eigenvalues[1]*.15};
+    evidence={n,planar};
     // Reuse the surface fit: supported creases/curves or thin linear geometry.
     // Isolated points and roughly isotropic 3D noise are not geometric edges.
     if(edge && count>=8 && trace>size*size*.1) {
@@ -180,230 +174,71 @@ Point fit(const models::RoomMapPoint& center,const DenseCells& cells,float size,
     return result;
 }
 
-class CornerDetector {
-    struct Sample {
-        SurfaceEvidence surface;
-        double score{-1.0};
-    };
-    struct Plane {
-        Vec3 normal{};
-        double offset_sum{};
-        unsigned support{};
-    };
-
-    const DenseCells& cells_;
-    float size_;
-    std::unordered_map<Voxel,Sample,transport::MapVoxelHash> samples_;
-
-    Sample& sample(const Voxel& key,const models::RoomMapPoint& point) {
-        const auto insert=samples_.try_emplace(key);
-        if(insert.second) fit(point,cells_,size_,insert.first->second.surface);
-        return insert.first->second;
-    }
-
-    double score(const Voxel& key,const models::RoomMapPoint& center) {
-        auto& current=sample(key,center);
-        if(!current.surface.corner_candidate) return 0;
-        if(current.score>=0) return current.score;
-        current.score=0;
-
-        // Group nearby planar patches by normal direction. Each of the three
-        // planes needs separate support close to the observed candidate.
-        std::array<Plane,8> planes{};
-        unsigned count{};
-        const double radius=corner_radius_cells*static_cast<double>(size_);
-        for(int x=-corner_radius_cells;x<=corner_radius_cells;++x)
-        for(int y=-corner_radius_cells;y<=corner_radius_cells;++y)
-        for(int z=-corner_radius_cells;z<=corner_radius_cells;++z) {
-            const Voxel neighbor{key.x+x,key.y+y,key.z+z};
-            const auto* point=cells_.find(neighbor);
-            if(!point) continue;
-            const auto delta=displacement(center,*point);
-            if(dot(delta,delta)>radius*radius) continue;
-            const auto& surface=sample(neighbor,*point).surface;
-            if(!surface.planar || std::abs(dot(surface.normal,delta))>.9*size_) continue;
-
-            unsigned best=count;
-            double similarity=.92;
-            for(unsigned i=0;i<count;++i) {
-                const double alignment=std::abs(dot(surface.normal,planes[i].normal));
-                if(alignment>similarity) {best=i;similarity=alignment;}
-            }
-            if(best==count) {
-                if(count==planes.size()) continue;
-                planes[count++].normal=surface.normal;
-            }
-            auto& plane=planes[best];
-            const double offset=dot(plane.normal,delta);
-            if(std::abs(offset)>.9*size_) continue;
-            plane.offset_sum+=offset;
-            ++plane.support;
-        }
-
-        for(unsigned i=0;i<count;++i) for(unsigned j=i+1;j<count;++j) for(unsigned k=j+1;k<count;++k) {
-            const auto& a=planes[i];const auto& b=planes[j];const auto& c=planes[k];
-            if(std::min({a.support,b.support,c.support})<3) continue;
-            const auto bc=cross(b.normal,c.normal);
-            const double determinant=dot(a.normal,bc);
-            if(std::abs(determinant)<.45) continue;
-            const auto ca=cross(c.normal,a.normal),ab=cross(a.normal,b.normal);
-            const double da=a.offset_sum/a.support,db=b.offset_sum/b.support,dc=c.offset_sum/c.support;
-            Vec3 intersection{};
-            for(unsigned axis=0;axis<3;++axis) {
-                intersection[axis]=(da*bc[axis]+db*ca[axis]+dc*ab[axis])/determinant;
-            }
-            const double distance=std::sqrt(dot(intersection,intersection))/size_;
-            // Never extrapolate a distant vertex from the three plane equations.
-            if(distance<=1.25) current.score=std::max(current.score,2.0-distance+.1*std::abs(determinant));
-        }
-        return current.score;
-    }
-
-public:
-    CornerDetector(const DenseCells& cells,float size):cells_(cells),size_(size) {}
-
-    void record(const models::RoomMapPoint& point,const SurfaceEvidence& evidence) {
-        samples_.try_emplace(voxel(point,size_),Sample{evidence});
-    }
-
-    bool keep(const models::RoomMapPoint& center) {
-        const auto key=voxel(center,size_);
-        const double strength=score(key,center);
-        if(strength<=0) return false;
-        const double radius=2.5*size_;
-        for(int x=-suppression_radius_cells;x<=suppression_radius_cells;++x)
-        for(int y=-suppression_radius_cells;y<=suppression_radius_cells;++y)
-        for(int z=-suppression_radius_cells;z<=suppression_radius_cells;++z) {
-            if(x==0 && y==0 && z==0) continue;
-            const Voxel neighbor{key.x+x,key.y+y,key.z+z};
-            const auto* other=cells_.find(neighbor);
-            if(!other) continue;
-            const auto delta=displacement(center,*other);
-            if(dot(delta,delta)>radius*radius) continue;
-            const auto other_strength=score(neighbor,*other);
-            if(other_strength>strength || (other_strength==strength &&
-                std::tie(neighbor.x,neighbor.y,neighbor.z)<std::tie(key.x,key.y,key.z))) return false;
-        }
-        return true;
-    }
-};
-
 struct Page {
     std::shared_ptr<transport::detail::SessionDirectory> directory;
     vista::fs::path file;
-    std::uint64_t count{},edge_count{},corner_count{};
-    std::vector<models::RoomMapPoint> corner_centers;
+    std::uint64_t count{},edge_count{},layout_count{};
     std::array<double,6> bounds{};
 
     std::pair<std::uint64_t,std::uint64_t> range(models::GaussianSurfaceMode mode) const {
         switch(mode) {
             case models::GaussianSurfaceMode::edges: return {count,edge_count};
-            case models::GaussianSurfaceMode::corners: return {count+edge_count,corner_count};
+            case models::GaussianSurfaceMode::corners: return {0,0};
             case models::GaussianSurfaceMode::full_surface: return {0,count};
         }
         return {0,0};
     }
     ~Page() {std::error_code ignored;vista::fs::remove(file,ignored);}
 };
-using CornerGrid = std::unordered_map<Voxel,std::vector<models::RoomMapPoint>,transport::MapVoxelHash>;
-
-// Each eligible edge adds only its distance and index to the cache. The
-// Gaussian records stay in the existing geometry page, shared with Edges.
-struct CornerEdgeIndex {
-    std::shared_ptr<transport::detail::SessionDirectory> directory;
-    vista::fs::path file;
-    std::uint64_t count{};
-
-    template <typename T>
-    static T read(std::istream& input, std::uint64_t offset) {
-        T value{};
-        input.seekg(static_cast<std::streamoff>(offset));
-        input.read(reinterpret_cast<char*>(&value),sizeof(value));
-        if (!input) throw std::runtime_error("truncated Gaussian corner edge index");
-        return value;
-    }
-
-    std::uint64_t count_within(double radius) const {
-        vista::io::ifstream input(file,std::ios::binary);
-        const auto squared=radius*radius;
-        std::uint64_t low{}, high=count;
-        while (low<high) {
-            const auto middle=low+(high-low)/2;
-            if (read<double>(input,middle*sizeof(double))<=squared) low=middle+1;
-            else high=middle;
-        }
-        return low;
-    }
-
-    std::uint32_t original_edge(std::istream& input, std::uint64_t index) const {
-        return read<std::uint32_t>(input,count*sizeof(double)+index*sizeof(std::uint32_t));
-    }
-
-    ~CornerEdgeIndex() {std::error_code ignored;vista::fs::remove(file,ignored);}
-};
-
-std::shared_ptr<const CornerEdgeIndex> index_corner_edges(const Page& page, const CornerGrid& grid,
-    vista::fs::path file, const std::function<bool()>& cancelled) {
-    constexpr auto radius=models::maximum_gaussian_corner_radius_m;
-    constexpr auto radius_squared=radius*radius;
-    struct Entry { double squared; std::uint32_t index; };
-    std::vector<Entry> ranked;
-    vista::io::ifstream input(page.file,std::ios::binary);
-    input.seekg(static_cast<std::streamoff>(page.count*record_bytes));
-    for (std::uint32_t i=0;i<page.edge_count;++i) {
-        if (i%256==0 && cancelled && cancelled()) return {};
-        const auto center=read_point(input).center;
-        const auto bucket=voxel(center,static_cast<float>(radius));
-        auto closest=std::numeric_limits<double>::infinity();
-        for (int dx=-1;dx<=1;++dx) for (int dy=-1;dy<=1;++dy) for (int dz=-1;dz<=1;++dz) {
-            const auto found=grid.find({bucket.x+dx,bucket.y+dy,bucket.z+dz});
-            if (found==grid.end()) continue;
-            for (const auto& corner : found->second) {
-                const auto delta=displacement(center,corner);
-                closest=std::min(closest,dot(delta,delta));
-            }
-        }
-        // Keep a marker as the only representation of its own center.
-        if (closest>0 && closest<=radius_squared) ranked.push_back({closest,i});
-    }
-    if (ranked.empty()) return {};
-    std::sort(ranked.begin(),ranked.end(),[](const Entry& a,const Entry& b) {
-        return std::tie(a.squared,a.index)<std::tie(b.squared,b.index);
-    });
-    auto index=std::make_shared<CornerEdgeIndex>();
-    index->directory=page.directory;
-    index->file=std::move(file);
-    index->count=ranked.size();
-    vista::io::ofstream output(index->file,std::ios::binary|std::ios::trunc);
-    for (const auto& edge : ranked)
-        output.write(reinterpret_cast<const char*>(&edge.squared),sizeof(edge.squared));
-    for (const auto& edge : ranked)
-        output.write(reinterpret_cast<const char*>(&edge.index),sizeof(edge.index));
-    output.flush();
-    if (!output) throw std::runtime_error("cannot write Gaussian corner edge index");
-    return index;
-}
-
 class View final : public models::GaussianMapViewSource {
 public:
     std::map<Key,std::shared_ptr<const Page>> pages;
-    std::map<Key,std::shared_ptr<const CornerEdgeIndex>> corner_edges;
+    models::RoomLayout layout;
+    const models::RoomLayout* room_layout() const override { return &layout; }
+    models::RoomLayout build_layout(const RoomLayoutReference& reference, double voxel_size,
+                                   const std::function<bool()>& cancelled) const {
+        // Stream a bounded set of planar samples already cached with the surfels.
+        std::multimap<double,const Page*> closest;
+        for (const auto& entry : pages) {
+            const auto& page = *entry.second;
+            if (!page.layout_count) continue;
+            double distance2 = 0;
+            for (std::size_t i = 0; i < 3; ++i) {
+                const auto p = reference.lidar_position[i];
+                const auto d = p-std::clamp(p,page.bounds[i],page.bounds[i+3]);
+                distance2 += d*d;
+            }
+            if (!(distance2<=15*15)) continue;
+            closest.emplace(distance2,&page);
+            if (closest.size()>layout_tile_limit) closest.erase(std::prev(closest.end()));
+        }
+        std::vector<RoomLayoutSample> samples;
+        for (const auto& entry : closest) {
+            if (cancelled && cancelled()) return {};
+            const auto& page = *entry.second;
+            vista::io::ifstream file(page.file,std::ios::binary);
+            file.seekg(static_cast<std::streamoff>((page.count+page.edge_count)*record_bytes));
+            for (std::size_t i = 0; i < page.layout_count; ++i) {
+                RoomLayoutSample sample{};
+                file.read(reinterpret_cast<char*>(sample.position.data()),3*sizeof(float));
+                file.read(reinterpret_cast<char*>(sample.normal.data()),3*sizeof(float));
+                if (!file) throw std::runtime_error("truncated room-layout samples");
+                samples.push_back(sample);
+            }
+        }
+        return estimate_room_layout(samples,reference,voxel_size,cancelled);
+    }
     std::array<double,6> box{-1,-1,-1,1,1,1};
     std::array<double,6> bounds() const override {return box;}
 
     std::vector<Point> select_splats(const models::RoomMapViewRequest& request) const override {
         if(!request.point_budget || request.point_budget>2'000'000) throw std::invalid_argument("invalid Gaussian view budget");
-        const auto radius=request.gaussian_corner_radius_m.value_or(0);
-        if (!std::isfinite(radius) || radius<0 || radius>models::maximum_gaussian_corner_radius_m)
-            throw std::invalid_argument("invalid Gaussian corner radius");
-        const bool near_corners=request.surface_mode==models::GaussianSurfaceMode::corners && radius>0;
         struct Slice {
             const Page* page;
             std::uint64_t offset,count;
-            const CornerEdgeIndex* index{};
         };
-        std::vector<Slice> primary, nearby;
-        std::uint64_t primary_count{}, nearby_count{};
+        std::vector<Slice> primary;
+        std::uint64_t primary_count{};
         for(const auto& entry:pages) {
             const auto& page=*entry.second;bool outside=false;
             if(request.has_camera) for(const auto& plane:request.planes) {
@@ -414,33 +249,22 @@ public:
             if (outside) continue;
             const auto [offset,count]=page.range(request.surface_mode);
             if (count) { primary.push_back({&page,offset,count});primary_count+=count; }
-            if (near_corners) {
-                const auto found=corner_edges.find(entry.first);
-                if (found!=corner_edges.end()) {
-                    const auto matches=found->second->count_within(radius);
-                    if (matches) {
-                        nearby.push_back({&page,page.count,matches,found->second.get()});
-                        nearby_count+=matches;
-                    }
-                }
-            }
+
         }
         std::vector<Point> result;
-        result.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(primary_count+nearby_count,request.point_budget)));
+        result.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(primary_count,request.point_budget)));
         const auto sample=[&](const std::vector<Slice>& slices,std::uint64_t total) {
             const auto wanted=std::min<std::uint64_t>(total,request.point_budget-result.size());
             std::uint64_t base{},sample_index{};
             for (const auto& slice:slices) {
                 if (sample_index==wanted) break;
                 vista::io::ifstream input(slice.page->file,std::ios::binary);
-                vista::io::ifstream ranks;
-                if (slice.index) ranks.open(slice.index->file,std::ios::binary);
                 auto next_record=std::numeric_limits<std::uint64_t>::max();
                 while(sample_index<wanted) {
                     const auto index=static_cast<std::uint64_t>((static_cast<long double>(sample_index)+.5L)*total/wanted);
                     if(index>=base+slice.count) break;
                     const auto local=index-base;
-                    const auto record=slice.offset+(slice.index?slice.index->original_edge(ranks,local):local);
+                    const auto record=slice.offset+local;
                     if(record!=next_record) input.seekg(static_cast<std::streamoff>(record*record_bytes));
                     next_record=record+1;
                     auto p=read_point(input);bool inside=true;
@@ -452,9 +276,7 @@ public:
                 base+=slice.count;
             }
         };
-        // Commit the vertex markers first so a tight budget still shows corners.
         sample(primary,primary_count);
-        sample(nearby,nearby_count);
         return result;
     }
 };
@@ -480,7 +302,8 @@ GaussianMapBuilder::GaussianMapBuilder(vista::fs::path root):impl_(std::make_uni
 GaussianMapBuilder::~GaussianMapBuilder()=default;
 std::uint64_t GaussianMapBuilder::rebuilt_tiles() const {return impl_->rebuilt;}
 std::shared_ptr<const models::GaussianMapViewSource> GaussianMapBuilder::update(
-    const models::RoomMapSurfaceSnapshot& source,const std::function<bool()>& cancelled) {
+    const models::RoomMapSurfaceSnapshot& source,const std::function<bool()>& cancelled,
+    const std::optional<RoomLayoutReference>& layout) {
     if(!std::isfinite(source.voxel_size)||source.voxel_size<.001F||!std::isfinite(source.tile_size)||
        source.tile_size<source.voxel_size || std::ceil(source.tile_size/source.voxel_size)>65)
         throw std::invalid_argument("invalid Gaussian source tile dimensions");
@@ -494,7 +317,7 @@ std::shared_ptr<const models::GaussianMapViewSource> GaussianMapBuilder::update(
     for(const auto& entry:impl_->processed) if(!source.regions.count(entry.first)) changed.insert(entry.first);
     if(changed.empty()) return impl_->view;
     auto next=std::make_shared<View>(*impl_->view);
-    if(dimensions) {next->pages.clear();next->corner_edges.clear();}
+    if(dimensions) next->pages.clear();
     std::set<Key> affected;
     const double margin=(tile_halo_cells+.01)*source.voxel_size;
     const int reach=static_cast<int>(std::ceil(margin/source.tile_size));
@@ -532,7 +355,6 @@ std::shared_ptr<const models::GaussianMapViewSource> GaussianMapBuilder::update(
             if(a.y!=b.y) return a.y<b.y;
             return a.z<b.z;});
         const DenseCells lookup(cells,centers,source.voxel_size);
-        CornerDetector corners(lookup,source.voxel_size);
         auto page=std::make_shared<Page>();page->file=impl_->root/(std::to_string(++impl_->serial)+".gsurf");
         page->directory=impl_->directory;
         page->count=centers.size();
@@ -540,70 +362,32 @@ std::shared_ptr<const models::GaussianMapViewSource> GaussianMapBuilder::update(
             (k[0]+1)*source.tile_size,(k[1]+1)*source.tile_size,(k[2]+1)*source.tile_size};
         vista::io::ofstream out(page->file,std::ios::binary|std::ios::trunc);
         std::vector<Point> edges;
+        std::vector<RoomLayoutSample> layout_samples;
+        std::unordered_set<Voxel,transport::MapVoxelHash> sampled;
         for(std::size_t i=0;i<centers.size();++i) {
             if(i%256==0 && cancelled && cancelled()) return {};
             bool edge_splat{};
             SurfaceEvidence evidence;
             const auto point=fit(centers[i],lookup,source.voxel_size,evidence,&edge_splat);
-            corners.record(centers[i],evidence);
+            if (evidence.planar && sampled.insert(voxel(centers[i],.18F)).second) {
+                const auto& p=centers[i];
+                const auto& n=evidence.normal;
+                layout_samples.push_back({{p.x,p.y,p.z},
+                    {static_cast<float>(n[0]),static_cast<float>(n[1]),static_cast<float>(n[2])}});
+            }
             write_point(out,point);if(edge_splat) edges.push_back(point);
         }
         // Append separate contiguous views for bounded reads on camera changes.
         page->edge_count=edges.size();for(const auto& point:edges) write_point(out,point);
-        const float marker_variance=.64F*source.voxel_size*source.voxel_size;
-        for(std::size_t i=0;i<centers.size();++i) {
-            if(i%256==0 && cancelled && cancelled()) return {};
-            if(!corners.keep(centers[i])) continue;
-            Point marker;
-            marker.center=centers[i];
-            marker.covariance={marker_variance,0,0,marker_variance,0,marker_variance};
-            marker.opacity=.98F;
-            write_point(out,marker);
-            ++page->corner_count;
-            page->corner_centers.push_back(marker.center);
+        page->layout_count=std::min(layout_samples_per_tile,layout_samples.size());
+        for (std::size_t i = 0; i < page->layout_count; ++i) {
+            const auto& sample = layout_samples[i*layout_samples.size()/page->layout_count];
+            out.write(reinterpret_cast<const char*>(sample.position.data()),3*sizeof(float));
+            out.write(reinterpret_cast<const char*>(sample.normal.data()),3*sizeof(float));
         }
         out.flush();if(!out) throw std::runtime_error("cannot flush Gaussian cache");out.close();
         next->pages.insert_or_assign(k,std::move(page));++impl_->rebuilt;
     }
-    CornerGrid corners_in_map;
-    for (const auto& entry : next->pages) for (const auto& center : entry.second->corner_centers) {
-        const auto bucket=voxel(center,static_cast<float>(models::maximum_gaussian_corner_radius_m));
-        corners_in_map[bucket].push_back(center);
-    }
-    if (corners_in_map.empty()) next->corner_edges.clear();
-    else {
-        auto refresh_edges=affected;
-        if (dimensions) for (const auto& entry : next->pages) refresh_edges.insert(entry.first);
-        const auto edge_reach=static_cast<std::int64_t>(
-            std::ceil(models::maximum_gaussian_corner_radius_m/source.tile_size));
-        const auto corner_centers=[](const View& view,const Key& key) -> const std::vector<models::RoomMapPoint>& {
-            static const std::vector<models::RoomMapPoint> empty;
-            const auto page=view.pages.find(key);
-            return page==view.pages.end()?empty:page->second->corner_centers;
-        };
-        for (const auto& key : affected) {
-            if (corner_centers(*impl_->view,key)==corner_centers(*next,key)) continue;
-            // Find existing pages in the tile range, including across the
-            // origin. Iterating the sparse catalog avoids a dense radius cube.
-            const auto minimum=std::numeric_limits<std::int64_t>::min();
-            for (auto page=next->pages.lower_bound({key[0]-edge_reach,minimum,minimum});
-                 page!=next->pages.end() && page->first[0]<=key[0]+edge_reach;++page) {
-                if (std::abs(page->first[1]-key[1])<=edge_reach &&
-                    std::abs(page->first[2]-key[2])<=edge_reach) refresh_edges.insert(page->first);
-            }
-        }
-        for (const auto& key : refresh_edges) {
-            if (cancelled && cancelled()) return {};
-            next->corner_edges.erase(key);
-            const auto found=next->pages.find(key);
-            if (found==next->pages.end() || !found->second->edge_count) continue;
-            const auto path=impl_->root/(std::to_string(++impl_->serial)+".gcorner");
-            auto index=index_corner_edges(*found->second,corners_in_map,path,cancelled);
-            if (cancelled && cancelled()) return {};
-            if (index) next->corner_edges.emplace(key,std::move(index));
-        }
-    }
-
     if(!next->pages.empty()) {
         next->box={std::numeric_limits<double>::infinity(),std::numeric_limits<double>::infinity(),std::numeric_limits<double>::infinity(),
             -std::numeric_limits<double>::infinity(),-std::numeric_limits<double>::infinity(),-std::numeric_limits<double>::infinity()};
@@ -612,6 +396,15 @@ std::shared_ptr<const models::GaussianMapViewSource> GaussianMapBuilder::update(
             next->box[i+3]=std::max(next->box[i+3],entry.second->bounds[i+3]);
         }
     } else next->box={-1,-1,-1,1,1,1};
+    next->layout={};
+    if (layout) {
+        try {
+            next->layout=next->build_layout(*layout,source.voxel_size,cancelled);
+            if (cancelled && cancelled()) return {};
+        } catch (const std::runtime_error& error) {
+            std::cerr<<"Room layout unavailable: "<<error.what()<<'\n';
+        }
+    }
     impl_->view=next;impl_->processed=source.regions;
     impl_->voxel_size=source.voxel_size;impl_->tile_size=source.tile_size;
     return next;
@@ -635,13 +428,15 @@ platform::WorkerHandle spawn_gaussian_map_worker(platform::MessageBus& bus,platf
     platform::StopToken stop,GaussianMapConfig config,GaussianMapCompletion complete) {
     auto subscriber=bus.subscribe<models::RoomMapViewMessage>(models::topics::room_map_view,thread.name);
     auto publisher=bus.publisher<models::RoomMapViewMessage>(models::topics::gaussian_map_view);
+    auto poses=bus.subscribe<models::LidarPoseStatus>(models::topics::lidar_pose,thread.name);
     return platform::spawn_worker(std::move(thread),[stop,config=std::move(config),subscriber=std::move(subscriber),
-        publisher=std::move(publisher),complete=std::move(complete)]() mutable {
+        publisher=std::move(publisher),poses=std::move(poses),complete=std::move(complete)]() mutable {
         try {
             GaussianMapBuilder builder(config.storage_directory);GaussianMapReport report;
             std::shared_ptr<const models::RoomMapSurfaceSnapshot> previous;
             std::shared_ptr<const models::GaussianMapViewSource> view;std::uint64_t revision{},mapping_generation{};
             std::string last_error;
+            std::shared_ptr<const models::LidarPoseStatus> pose;
             while(!stop.is_stop_requested()) {
                 std::shared_ptr<const models::RoomMapViewMessage> latest,extra;
                 const auto received=subscriber.receive_for(latest,std::chrono::milliseconds(50));
@@ -654,7 +449,15 @@ platform::WorkerHandle spawn_gaussian_map_worker(platform::MessageBus& bus,platf
                     if(snapshot && !snapshot->error.empty()) throw std::runtime_error(snapshot->error);
                     if(snapshot && (!previous || snapshot->geometry_revision!=previous->geometry_revision ||
                         snapshot->regions!=previous->regions || latest->mapping_generation!=mapping_generation)) {
-                        auto updated=builder.update(*snapshot,[&]{return stop.is_stop_requested();});if(!updated) break;
+                        std::shared_ptr<const models::LidarPoseStatus> newer;
+                        for (unsigned i=0;i<32 && poses.try_receive(newer)==platform::ReceiveStatus::message;++i)
+                            pose=std::move(newer);
+                        auto layout=config.layout;
+                        if (pose && pose->pose && pose->mapping_generation==latest->mapping_generation) {
+                            layout.lidar_position=pose->pose->position_m;
+                            if (pose->pose->world_up) layout.world_up=*pose->pose->world_up;
+                        }
+                        auto updated=builder.update(*snapshot,[&]{return stop.is_stop_requested();},layout);if(!updated) break;
                         view=std::move(updated);previous=snapshot;++revision;++report.completed_revisions;
                     } else if(!snapshot) {view.reset();previous.reset();++revision;}
                     mapping_generation=latest->mapping_generation;
