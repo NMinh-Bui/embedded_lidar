@@ -16,6 +16,14 @@ constexpr double offset_step = .15;
 constexpr double max_room_radius = 12;
 constexpr std::size_t max_walls = 8;
 constexpr std::size_t max_segments = 96;
+constexpr double sample_gap_m = .30;
+constexpr double max_inferred_gap_m = .45;
+constexpr double min_opening_width_m = .65;
+constexpr double floor_support_height_m = .18;
+constexpr double ceiling_grid_m = .18;
+constexpr double ceiling_band_m = .12;
+constexpr std::size_t max_ceiling_levels = 6;
+constexpr std::size_t max_ceiling_segments = 32;
 
 template<std::size_t N>
 double dot(const std::array<double,N>& a, const std::array<double,N>& b) {
@@ -41,12 +49,28 @@ struct WallHit {
     Point2 position, normal;
     double height;
 };
+struct Span {
+    double low{}, high{};
+    double length() const { return high-low; }
+};
+
+struct WallSpan {
+    Span extent;
+    std::array<const WallSpan*,2> joins{};
+};
+
 struct Wall {
     Point2 normal;
     double offset{};
     std::vector<std::pair<double,double>> hits; // Tangential coordinate and height.
     double low{}, high{}, low_height{}, high_height{};
-    double angle() const { return std::atan2(normal[1], normal[0]); }
+    double trace_height{};
+    std::vector<WallSpan> spans;
+
+    Point2 at(double along) const {
+        const auto axis = tangent(normal);
+        return {normal[0]*offset+axis[0]*along,normal[1]*offset+axis[1]*along};
+    }
 };
 
 void fit_wall(const std::vector<WallHit>& hits, double tolerance, Wall& wall) {
@@ -118,67 +142,304 @@ std::optional<double> level(const std::map<int,HorizontalBin>& bins) {
     return std::nullopt;
 }
 
-std::optional<Point2> intersect(const Wall& left, const Wall& right, const std::vector<Wall>& walls) {
+std::optional<Point2> intersect(const Wall& left, const Wall& right) {
     const auto& a = left.normal;
     const auto& b = right.normal;
     const double det = a[0]*b[1]-a[1]*b[0];
-    // The angularly adjacent walls must form a finite interior corner.
-    if (det<.30) return std::nullopt;
+    if (std::abs(det)<.30) return std::nullopt;
     const Point2 p{(left.offset*b[1]-a[1]*right.offset)/det,
                    (a[0]*right.offset-left.offset*b[0])/det};
-    if (dot(p,p)>max_room_radius*max_room_radius ||
-        std::any_of(walls.begin(),walls.end(),[&](const auto& w){return dot(w.normal,p)>w.offset+.20;}))
-        return std::nullopt;
+    if (dot(p,p)>max_room_radius*max_room_radius) return std::nullopt;
     return p;
 }
-bool within_support(const Wall& w, const Point2& p, double allowance) {
-    const auto along = dot(tangent(w.normal),p);
-    return along>=w.low-allowance && along<=w.high+allowance;
-}
-std::pair<double,double> height_support(const Wall& wall, const Point2& p) {
-    const auto along = dot(tangent(wall.normal),p);
+
+std::pair<double,double> height_support(const Wall& wall, const Span& extent) {
     double low = std::numeric_limits<double>::infinity(), high = -low;
-    for (const auto& hit : wall.hits) if (std::abs(hit.first-along)<=.28) {
-        low = std::min(low,hit.second);
-        high = std::max(high,hit.second);
+    const auto start=std::lower_bound(wall.hits.begin(),wall.hits.end(),extent.low,
+        [](const auto& hit, double value) {return hit.first<value;});
+    for (auto it=start; it!=wall.hits.end() && it->first<=extent.high; ++it) {
+        low = std::min(low,it->second);
+        high = std::max(high,it->second);
     }
     return {low,high};
 }
-struct Corner {
-    Point2 xy;
-    double top{};
-    bool inferred{};
+
+std::vector<Span> measured_spans(const Wall& wall, double min_height, double max_height, double min_length) {
+    std::vector<Span> spans;
+    for (const auto& [along,height] : wall.hits) {
+        if (height<min_height || height>max_height) continue;
+        if (spans.empty() || along-spans.back().high>sample_gap_m) spans.push_back({along,along});
+        else spans.back().high=along;
+    }
+    spans.erase(std::remove_if(spans.begin(),spans.end(),[=](const auto& span) {
+        return span.length()<min_length;
+    }),spans.end());
+    return spans;
+}
+
+void find_wall_spans(Wall& wall, const std::optional<double>& floor) {
+    constexpr double min_length = .35;
+    auto spans=measured_spans(wall,wall.low_height,wall.high_height,min_length);
+    // A lintel can cover an opening in plan view. Look for support at ordinary
+    // wall height on either side before treating the intervening area as a wall.
+    const auto lower_limit=floor ? *floor+1.65 : wall.low_height+.90;
+    const auto lower=measured_spans(wall,wall.low_height,lower_limit,min_length);
+    std::vector<Span> pieces;
+    for (auto span : spans) {
+        for (std::size_t i=1; i<lower.size(); ++i) {
+            const Span opening{lower[i-1].high,lower[i].low};
+            if (opening.length()<min_opening_width_m || opening.low<span.low || opening.high>span.high)
+                continue;
+            pieces.push_back({span.low,opening.low});
+            span.low=opening.high;
+        }
+        pieces.push_back(span);
+    }
+    for (const auto& piece : pieces) {
+        const auto [low,high]=height_support(wall,piece);
+        if (piece.length()>=min_length && high-low>=.25) wall.spans.push_back({piece});
+    }
+}
+
+struct WallEnd {
+    WallSpan* span{};
+    std::size_t side{};
+    double along{}, distance{max_inferred_gap_m};
 };
+
+WallEnd nearest_end(Wall& wall, const Point2& p) {
+    const auto along=dot(tangent(wall.normal),p);
+    WallEnd end;
+    for (auto& span : wall.spans) {
+        const auto consider=[&](std::size_t side, double coordinate) {
+            const auto distance=std::abs(along-coordinate);
+            if (distance<=end.distance) end={&span,side,coordinate,distance};
+        };
+        consider(0,span.extent.low);
+        consider(1,span.extent.high);
+    }
+    return end;
+}
+
+struct CornerCandidate {
+    Wall* a;
+    Wall* b;
+    WallEnd left, right;
+    Point2 position;
+    double low_height, high_height;
+};
+
+bool is_closed(const std::vector<Wall>& walls) {
+    const WallSpan* first{};
+    std::size_t count{};
+    for (const auto& wall : walls) {
+        for (const auto& span : wall.spans) {
+            if (!span.joins[0] || !span.joins[1]) return false;
+            if (!first) first=&span;
+            ++count;
+        }
+    }
+    if (count<3) return false;
+    const WallSpan* previous=first;
+    const WallSpan* current=first->joins[0];
+    std::size_t visited=1;
+    while (current!=first && visited<count) {
+        const auto next=current->joins[current->joins[0]==previous ? 1 : 0];
+        previous=current;
+        current=next;
+        ++visited;
+    }
+    return current==first && visited==count;
+}
 
 void segment(models::RoomLayout& result, const Point3& start, const Point3& end, bool inferred) {
     if (result.segments.size()>=max_segments) return;
     const Point3 d{start[0]-end[0],start[1]-end[1],start[2]-end[2]};
     if (dot(d,d)>.0004) result.segments.push_back({start,end,inferred});
 }
-void rail(models::RoomLayout& result, const FloorBasis& basis, const Wall& wall,
-          double low, double high, double h, bool estimated) {
-    const auto axis = tangent(wall.normal);
-    const auto world = [&](double t) {
-        return basis.world({wall.normal[0]*wall.offset+axis[0]*t,
-                            wall.normal[1]*wall.offset+axis[1]*t}, h);
+void trace(models::RoomLayout& result, const FloorBasis& basis, const Wall& wall,
+           const Span& extent, double height, const std::vector<Span>& supported) {
+    const auto draw=[&](double from, double to, bool inferred) {
+        segment(result,basis.world(wall.at(from),height),basis.world(wall.at(to),height),inferred);
     };
-    if (estimated) {
-        segment(result,world(low),world(high),true);
-        return;
-    }
-    // Merge measured runs across normal sample spacing, leaving wider holes dashed.
-    double cursor = low;
-    for (auto it = wall.hits.begin(); it!=wall.hits.end();) {
-        const auto start = it->first;
-        auto end = start;
-        for (++it; it!=wall.hits.end() && it->first-end<=.30; ++it) end = it->first;
-        const auto a = std::max(low,start-.10), b = std::min(high,end+.10);
+    double cursor=extent.low;
+    for (const auto& span : supported) {
+        const auto a=std::max(extent.low,span.low), b=std::min(extent.high,span.high);
         if (a>=b || b<=cursor) continue;
-        if (a>cursor) segment(result,world(cursor),world(a),true);
-        segment(result,world(std::max(cursor,a)),world(b),false);
-        cursor = b;
+        if (a>cursor) draw(cursor,a,true);
+        draw(std::max(cursor,a),b,false);
+        cursor=b;
     }
-    if (cursor<high) segment(result,world(cursor),world(high),true);
+    if (cursor<extent.high) draw(cursor,extent.high,true);
+}
+
+void draw_wall(models::RoomLayout& result, const FloorBasis& basis, const Wall& wall,
+               const std::optional<double>& floor) {
+    const auto near_floor=floor && result.floor==models::RoomLayoutFloor::measured ?
+        measured_spans(wall,*floor-.06,*floor+floor_support_height_m,.12) : std::vector<Span>{};
+    const auto near_trace=measured_spans(wall,wall.trace_height-.30,wall.trace_height+.15,.12);
+    for (std::size_t i=0; i<wall.spans.size(); ++i) {
+        const auto& extent=wall.spans[i].extent;
+        trace(result,basis,wall,extent,wall.trace_height,near_trace);
+        if (floor && *floor<wall.trace_height) trace(result,basis,wall,extent,*floor,near_floor);
+        if (i==0) continue;
+        const Span gap{wall.spans[i-1].extent.high,extent.low};
+        if (gap.length()>max_inferred_gap_m) continue;
+        trace(result,basis,wall,gap,wall.trace_height,{});
+        if (floor && *floor<wall.trace_height) trace(result,basis,wall,gap,*floor,{});
+    }
+}
+using CeilingBands = std::map<int,std::vector<std::pair<Point2,double>>>;
+using GridCell = std::array<int,2>;
+
+struct CeilingCell {
+    Point2 sum{};
+    double height{};
+    std::size_t count{};
+    bool visited{};
+
+    Point2 center() const { return {sum[0]/count,sum[1]/count}; }
+};
+
+double orientation(const Point2& a, const Point2& b, const Point2& p) {
+    return (b[0]-a[0])*(p[1]-a[1])-(b[1]-a[1])*(p[0]-a[0]);
+}
+
+std::vector<Point2> ceiling_hull(std::vector<Point2> points) {
+    std::sort(points.begin(),points.end());
+    std::vector<Point2> hull;
+    for (const auto& p : points) {
+        while (hull.size()>=2 && orientation(hull[hull.size()-2],hull.back(),p)<=0) hull.pop_back();
+        hull.push_back(p);
+    }
+    const auto lower_size=hull.size();
+    for (auto it=points.rbegin()+1; it!=points.rend(); ++it) {
+        while (hull.size()>lower_size && orientation(hull[hull.size()-2],hull.back(),*it)<=0) hull.pop_back();
+        hull.push_back(*it);
+    }
+    hull.pop_back();
+    // Adjacent steps from scan sampling often describe one straight edge.
+    for (std::size_t i=0; hull.size()>3 && i<hull.size();) {
+        const auto& a=hull[(i+hull.size()-1)%hull.size()];
+        const auto& b=hull[(i+1)%hull.size()];
+        const auto length=std::hypot(b[0]-a[0],b[1]-a[1]);
+        if (length>0 && std::abs(orientation(a,b,hull[i]))/length<=.08) {
+            hull.erase(hull.begin()+static_cast<std::ptrdiff_t>(i));
+            if (i>0) --i;
+        } else ++i;
+    }
+    return hull;
+}
+
+void trace_ceiling_edge(models::RoomLayout& layout, const FloorBasis& basis, const std::vector<Point2>& points,
+                        const Point2& a, const Point2& b, double height) {
+    const auto length=std::hypot(b[0]-a[0],b[1]-a[1]);
+    if (length<.38) return;
+    const Point2 axis{(b[0]-a[0])/length,(b[1]-a[1])/length};
+    const auto normal=tangent(axis);
+    std::vector<double> boundary;
+    std::size_t interior=0;
+    for (const auto& p : points) {
+        const Point2 d{p[0]-a[0],p[1]-a[1]};
+        const auto along=dot(d,axis), across=dot(d,normal);
+        if (along<-.02 || along>length+.02) continue;
+        if (std::abs(across)<=.10) boundary.push_back(std::clamp(along,0.,length));
+        if (across>=.23 && across<=.60) ++interior;
+    }
+    if (boundary.size()<3 || interior<3) return;
+    std::sort(boundary.begin(),boundary.end());
+    const auto at=[&](double t) {return basis.world({a[0]+t*axis[0],a[1]+t*axis[1]},height);};
+    std::optional<double> end;
+    for (auto first=boundary.begin(); first!=boundary.end();) {
+        auto next=first+1;
+        while (next!=boundary.end() && *next-*(next-1)<=sample_gap_m) ++next;
+        const auto last=*(next-1);
+        if (next-first>=3 && last-*first>=.33) {
+            if (end && *first-*end<=max_inferred_gap_m) segment(layout,at(*end),at(*first),true);
+            segment(layout,at(*first),at(last),false);
+            end=last;
+        }
+        first=next;
+    }
+}
+
+models::RoomLayout trace_ceiling_band(const FloorBasis& basis, const CeilingBands& bands, int level_bin) {
+    std::map<GridCell,CeilingCell> grid;
+    // Combine nearby samples around the peak without joining distinct levels.
+    for (auto it=bands.lower_bound(level_bin-1); it!=bands.end() && it->first<=level_bin+1; ++it) {
+        for (const auto& [xy,height] : it->second) {
+            if (std::abs(height-level_bin*ceiling_band_m)>.13) continue;
+            const GridCell key{static_cast<int>(std::floor(xy[0]/ceiling_grid_m)),
+                               static_cast<int>(std::floor(xy[1]/ceiling_grid_m))};
+            auto& cell=grid[key];
+            cell.sum[0]+=xy[0];cell.sum[1]+=xy[1];cell.height+=height;++cell.count;
+        }
+    }
+    models::RoomLayout layout;
+    for (auto& [start, cell] : grid) {
+        if (cell.visited) continue;
+        cell.visited=true;
+        std::vector<GridCell> pending{start};
+        std::vector<Point2> points;
+        double height_sum{};
+        for (std::size_t i=0; i<pending.size(); ++i) {
+            const auto key=pending[i];
+            const auto& current=grid.at(key);
+            points.push_back(current.center());height_sum+=current.height/current.count;
+            for (int dx=-1; dx<=1; ++dx) for (int dy=-1; dy<=1; ++dy) {
+                auto it=grid.find({key[0]+dx,key[1]+dy});
+                if (it==grid.end() || it->second.visited) continue;
+                it->second.visited=true;
+                pending.push_back(it->first);
+            }
+        }
+        if (points.size()<9) continue;
+        const auto height=height_sum/points.size();
+        const auto hull=ceiling_hull(points);
+        for (std::size_t i=0; i<hull.size(); ++i)
+            trace_ceiling_edge(layout,basis,points,hull[i],hull[(i+1)%hull.size()],height);
+    }
+    return layout;
+}
+
+void append_ceiling_traces(models::RoomLayout& layout, const FloorBasis& basis, const CeilingBands& bands,
+                           const std::function<bool()>& cancelled) {
+    std::vector<std::pair<std::size_t,int>> peaks;
+    for (const auto& [bin,samples] : bands) if (samples.size()>=9) peaks.emplace_back(samples.size(),bin);
+    std::sort(peaks.rbegin(),peaks.rend());
+    std::vector<int> processed;
+    std::vector<std::vector<models::RoomLayoutSegment>> levels;
+    for (const auto& [_,bin] : peaks) {
+        if (cancelled && cancelled()) return;
+        if (std::any_of(processed.begin(),processed.end(),[=](int other) {return std::abs(bin-other)<=2;})) continue;
+        processed.push_back(bin);
+        auto layer=trace_ceiling_band(basis,bands,bin);
+        if (!layer.segments.empty()) levels.push_back(std::move(layer.segments));
+        if (levels.size()>=max_ceiling_levels || processed.size()>=2*max_ceiling_levels) break;
+    }
+    const auto length=[](const auto& line) {
+        const Point3 d{line.end[0]-line.start[0],line.end[1]-line.start[1],line.end[2]-line.start[2]};
+        return dot(d,d);
+    };
+    for (auto& level : levels) {
+        std::stable_sort(level.begin(),level.end(),[&](const auto& a,const auto& b) {
+            if (a.inferred!=b.inferred) return !a.inferred;
+            return length(a)>length(b);
+        });
+    }
+    // A large upper ceiling must not exhaust the budget before a lower patch.
+    std::vector<models::RoomLayoutSegment> traces;
+    for (std::size_t rank=0; traces.size()<max_ceiling_segments; ++rank) {
+        const auto before=traces.size();
+        for (const auto& level : levels) {
+            if (rank<level.size()) traces.push_back(level[rank]);
+            if (traces.size()>=max_ceiling_segments) break;
+        }
+        if (traces.size()==before) break;
+    }
+    const auto keep=std::min(layout.segments.size(),max_segments-traces.size());
+    layout.segments.resize(keep);
+    layout.segments.insert(layout.segments.end(),traces.begin(),traces.end());
 }
 } // namespace
 
@@ -198,6 +459,7 @@ models::RoomLayout estimate_room_layout(const std::vector<RoomLayoutSample>& sam
     std::vector<WallHit> vertical;
     std::map<std::pair<int,int>,std::size_t> votes;
     std::map<int,HorizontalBin> floor_bins, ceiling_bins;
+    CeilingBands overhead;
     for (const auto& sample : samples) {
         const Point3 p{sample.position[0]-basis.origin[0],sample.position[1]-basis.origin[1],sample.position[2]-basis.origin[2]};
         const Point3 n{sample.normal[0],sample.normal[1],sample.normal[2]};
@@ -208,6 +470,7 @@ models::RoomLayout estimate_room_layout(const std::vector<RoomLayoutSample>& sam
             const auto bin = static_cast<int>(std::floor(h/.12+.5));
             if (h<-.25) floor_bins[bin].add(xy,h);
             if (h>.55) ceiling_bins[bin].add(xy,h);
+            if (h>.32) overhead[bin].emplace_back(xy,h);
         }
         if (nz>.30) continue;
         Point2 normal{dot(n,basis.x),dot(n,basis.y)};
@@ -241,13 +504,13 @@ models::RoomLayout estimate_room_layout(const std::vector<RoomLayoutSample>& sam
         // Broad support at multiple heights removes tiny object edges.
         if (wall.hits.size()<12 || wall.high-wall.low<.85 || wall.high_height-wall.low_height<.45)
             continue;
-        if (std::any_of(walls.begin(),walls.end(),[&](const Wall& item){return dot(item.normal,wall.normal)>.95;}))
+        if (std::any_of(walls.begin(),walls.end(),[&](const Wall& item) {
+            return dot(item.normal,wall.normal)>.985 &&
+                std::abs(item.offset-wall.offset)<2*tolerance;
+        }))
             continue;
         walls.push_back(std::move(wall));
     }
-    if (walls.size()<2) return result;
-    std::sort(walls.begin(),walls.end(),[](const auto& a,const auto& b){return a.angle()<b.angle();});
-
     auto floor = level(floor_bins);
     if (floor) result.floor = models::RoomLayoutFloor::measured;
     else if (reference.floor_datum) {
@@ -255,74 +518,58 @@ models::RoomLayout estimate_room_layout(const std::vector<RoomLayoutSample>& sam
         const auto h = dot(Point3{datum[0]-basis.origin[0],datum[1]-basis.origin[1],datum[2]-basis.origin[2]},basis.up);
         if (h<-.15 && h>-8) { floor=h;result.floor=models::RoomLayoutFloor::estimated; }
     }
-    const auto ceiling = level(ceiling_bins);
-    std::vector<std::optional<Corner>> corners(walls.size());
-    std::vector<std::optional<Point2>> candidates(walls.size());
-    std::size_t found = 0;
-    const auto add_corner = [&](std::size_t i, const Point2& xy, bool inferred) {
-        const auto& a = walls[i];
-        const auto& b = walls[(i+1)%walls.size()];
-        const auto a_heights = height_support(a,xy), b_heights = height_support(b,xy);
-        const auto support_top = std::min(a_heights.second,b_heights.second);
-        const auto top = ceiling.value_or(std::min(a.high_height,b.high_height));
-        const bool extrapolated = inferred || support_top<top-.26;
-        corners[i] = Corner{xy,top,extrapolated};
-        result.corners.push_back({basis.world(xy,top),extrapolated});
-        ++found;
-    };
-    for (std::size_t i=0; i<walls.size(); ++i) {
-        const auto& a = walls[i];
-        const auto& b = walls[(i+1)%walls.size()];
-        candidates[i] = intersect(a,b,walls);
-        if (candidates[i] && within_support(a,*candidates[i],.65) && within_support(b,*candidates[i],.65))
-            add_corner(i,*candidates[i],!within_support(a,*candidates[i],.22)||!within_support(b,*candidates[i],.22));
+    const auto ceiling=level(ceiling_bins);
+    for (auto& wall : walls) {
+        wall.trace_height=ceiling && std::abs(*ceiling-wall.high_height)<=.30 ? *ceiling : wall.high_height;
+        find_wall_spans(wall,floor);
     }
-    if (walls.size()==4 && found==3) {
-        bool rectangle=true;
-        for (std::size_t i=0; i<walls.size(); ++i)
-            rectangle = rectangle && std::abs(dot(walls[i].normal,walls[(i+1)%walls.size()].normal))<.14;
-        if (rectangle) for (std::size_t i=0; i<walls.size(); ++i)
-            if (!corners[i] && candidates[i]) add_corner(i,*candidates[i],true);
-    }
-    result.closed = walls.size()>=3 && found==walls.size();
-    if (!found) return result;
 
+    // Match only nearby ends with common height support. Other walls do not
+    // define a convex boundary around the sensor in open or irregular layouts.
+    std::vector<CornerCandidate> candidates;
     for (std::size_t i=0; i<walls.size(); ++i) {
-        if (!corners[i] || !floor || *floor>=corners[i]->top) continue;
-        const auto& corner = *corners[i];
-        const auto a = height_support(walls[i],corner.xy);
-        const auto b = height_support(walls[(i+1)%walls.size()],corner.xy);
-        const auto lo = std::max({*floor,a.first,b.first});
-        const auto hi = std::min({corner.top,a.second,b.second});
-        const auto point = [&](double h){return basis.world(corner.xy,h);};
-        if (corner.inferred || lo>=hi) segment(result,point(*floor),point(corner.top),true);
-        else {
-            segment(result,point(*floor),point(lo),true);
-            segment(result,point(lo),point(hi),false);
-            segment(result,point(hi),point(corner.top),true);
+        auto& a=walls[i];
+        for (std::size_t j=i+1; j<walls.size(); ++j) {
+            auto& b=walls[j];
+            const auto p=intersect(a,b);
+            if (!p) continue;
+            const auto left=nearest_end(a,*p), right=nearest_end(b,*p);
+            if (!left.span || !right.span) continue;
+            const auto a_heights=height_support(a,{left.along-.28,left.along+.28});
+            const auto b_heights=height_support(b,{right.along-.28,right.along+.28});
+            const auto low=std::max(a_heights.first,b_heights.first), high=std::min(a_heights.second,b_heights.second);
+            if (high-low>=.20) candidates.push_back({&a,&b,left,right,*p,low,high});
         }
     }
-    for (std::size_t i=0; i<walls.size(); ++i) {
-        const auto& wall = walls[i];
-        const auto& previous = corners[(i+walls.size()-1)%walls.size()];
-        const auto& next = corners[i];
-        if (!previous && !next) continue;
-        const auto axis = tangent(wall.normal);
-        double a = previous ? dot(axis,previous->xy) : wall.low;
-        double b = next ? dot(axis,next->xy) : wall.high;
-        if (a>b) std::swap(a,b);
-        const auto top = ceiling.value_or(wall.high_height);
-        // Keep rail heights consistent at shared corner endpoints when no ceiling is available.
-        if (ceiling) rail(result,basis,wall,a,b,top,false);
+    std::stable_sort(candidates.begin(),candidates.end(),[](const auto& a,const auto& b) {
+        return a.left.distance+a.right.distance<b.left.distance+b.right.distance;
+    });
+    for (const auto& candidate : candidates) {
+        if (result.corners.size()>=max_walls) break;
+        const auto& [a,b,left,right,position,low,high]=candidate;
+        if (left.span->joins[left.side] || right.span->joins[right.side]) continue;
+        left.span->joins[left.side]=right.span;
+        right.span->joins[right.side]=left.span;
+        const auto top=std::min(a->trace_height,b->trace_height);
+        const bool inferred=left.distance>.22 || right.distance>.22 || top-high>.26;
+        const auto at=[&](double height) {return basis.world(position,height);};
+        result.corners.push_back({at(top),inferred});
+        segment(result,basis.world(a->at(left.along),a->trace_height),at(top),true);
+        segment(result,basis.world(b->at(right.along),b->trace_height),at(top),true);
+        if (!floor || *floor>=top) continue;
+        segment(result,basis.world(a->at(left.along),*floor),at(*floor),true);
+        segment(result,basis.world(b->at(right.along),*floor),at(*floor),true);
+        const auto from=std::max(*floor,low), to=std::min(top,high);
+        if (inferred || from>=to) segment(result,at(*floor),at(top),true);
         else {
-            const auto start = previous ? basis.world(previous->xy,previous->top) :
-                basis.world({wall.offset*wall.normal[0]+wall.low*axis[0],wall.offset*wall.normal[1]+wall.low*axis[1]},top);
-            const auto end = next ? basis.world(next->xy,next->top) :
-                basis.world({wall.offset*wall.normal[0]+wall.high*axis[0],wall.offset*wall.normal[1]+wall.high*axis[1]},top);
-            segment(result,start,end,true);
+            segment(result,at(*floor),at(from),true);
+            segment(result,at(from),at(to),false);
+            segment(result,at(to),at(top),true);
         }
-        if (floor) rail(result,basis,wall,a,b,*floor,result.floor==models::RoomLayoutFloor::estimated);
     }
+    result.closed=is_closed(walls);
+    for (const auto& wall : walls) draw_wall(result,basis,wall,floor);
+    append_ceiling_traces(result,basis,overhead,cancelled);
     return result;
 }
 

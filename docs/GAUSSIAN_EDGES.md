@@ -25,12 +25,21 @@ At each changed RoomMap checkpoint the Gaussian worker estimates the outline
 from its cached planar samples. It aligns the horizontal analysis plane to
 Point-LIO gravity when available and uses the current LiDAR position as the
 interior reference. A wall needs support along its length and at multiple
-heights. Neighboring walls intersect to form candidate corners. The estimate
-can remain open when a wall is missing or curved. Three supported intersections
-can fill the fourth only if four observed wall planes support a rectangular layout.
+heights. Supported runs produce standalone wall lines, including when nearby
+wall ends are not visible. Small gaps can be dashed; larger gaps and observed
+openings remain open. Nearby wall ends can form a corner at an oblique angle
+when their height ranges overlap. Parallel walls can appear at different offsets.
+The outline is closed only when matched wall ends form one continuous loop.
+The same samples yield independent boundary traces from connected overhead
+surfaces. The checkpoint can trace up to six distinct height bands. Its
+32 ceiling segments are shared across the detected bands so a dense high
+ceiling does not take the entire budget. Each edge needs nearby boundary samples and planar support on its interior side. Gaps
+between disconnected surfaces remain open. Ceiling-only edges have no floor
+projection.
 
-The renderer shows projections along gravity when a floor level is available.
-Broad floor observations provide a measured level. When a positive Mount Z is
+The renderer projects each fitted wall trace onto the floor along gravity.
+Broad floor observations provide a measured level. A base segment is solid
+where wall samples reach the measured floor and dashed elsewhere. When a positive Mount Z is
 configured, the world origin can serve as an estimated floor datum; the lower
 projections are dashed. Set Mount Z to the physical sensor height if the origin
 is meant to be on the floor. Without a measured or estimated floor, the panel
@@ -69,7 +78,7 @@ versioned outline. Toggling the overlay does not request new splats. The older
 ## Deployment
 
 Build and restart `vista_edge` on ADLINK. Update the existing
-`vista-lidarpointcloud-panel` Grafana plugin with version 1.12.0 from the parent
+`vista-lidarpointcloud-panel` Grafana plugin with version 1.14.0 from the parent
 VISTA repository (`dashboard/plugins/lidarpointcloud/dist`), restart Grafana and
 hard-refresh the browser. The panel sources are outside this embedded submodule.
 

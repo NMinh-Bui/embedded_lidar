@@ -285,19 +285,171 @@ VISTA_TEST(gaussian_room_layout_keeps_open_room_and_labels_estimated_floor) {
     for (const auto& segment : unknown.segments)
         VISTA_CHECK(segment.start[2]>1 && segment.end[2]>1);
 }
-VISTA_TEST(gaussian_room_layout_extrapolates_fourth_supported_wall_intersection_as_inferred) {
+VISTA_TEST(gaussian_room_layout_leaves_large_corner_holes_open) {
     vista::application::RoomLayoutReference reference;
     reference.lidar_position={0,0,.7};
     const auto layout=vista::application::estimate_room_layout(room_layout_samples(true,true,true),reference,.05);
-    VISTA_CHECK(layout.closed && layout.corners.size()==4);
-    std::size_t inferred=0;
-    for (const auto& corner : layout.corners) {
-        if (!corner.inferred) continue;
-        VISTA_CHECK(corner.position[0]>1 && corner.position[1]>1);
-        ++inferred;
-    }
-    VISTA_CHECK(inferred==1);
+    VISTA_CHECK(!layout.closed && layout.corners.size()==3);
+    for (const auto& corner : layout.corners)
+        VISTA_CHECK(corner.position[0]<1 || corner.position[1]<1);
 }
+
+VISTA_TEST(gaussian_room_layout_projects_an_isolated_wall_and_marks_measured_base) {
+    using vista::models::RoomLayoutFloor;
+    std::vector<RoomLayoutSample> wall;
+    for (int y=-16; y<=16; ++y) for (int z=y<=-5 ? 0 : 5; z<=22; ++z)
+        wall.push_back({{2,y*.1F,z*.1F},{1,0,0}});
+    vista::application::RoomLayoutReference reference;
+    reference.lidar_position={0,0,.7};
+    const auto unknown=vista::application::estimate_room_layout(wall,reference,.05);
+    VISTA_CHECK(unknown.floor==RoomLayoutFloor::unknown && unknown.corners.empty() && !unknown.closed);
+    VISTA_CHECK(unknown.segments.size()==1);
+    const auto& upper=unknown.segments.front();
+    VISTA_CHECK(!upper.inferred);
+    VISTA_CHECK_NEAR(upper.start[2],2.2,1e-5);
+    VISTA_CHECK_NEAR(upper.start[2],upper.end[2],1e-6);
+
+    reference.floor_datum=vista::models::RoomLayoutPosition{0,0,0};
+    const auto estimated=vista::application::estimate_room_layout(wall,reference,.05);
+    VISTA_CHECK(estimated.floor==RoomLayoutFloor::estimated && estimated.segments.size()==2);
+    const auto& base=estimated.segments.back();
+    VISTA_CHECK(base.inferred);
+    VISTA_CHECK_NEAR(base.start[2],0,1e-6);
+    VISTA_CHECK_NEAR(base.end[2],0,1e-6);
+    for (unsigned axis=0; axis<2; ++axis) {
+        VISTA_CHECK_NEAR(upper.start[axis],base.start[axis],1e-6);
+        VISTA_CHECK_NEAR(upper.end[axis],base.end[axis],1e-6);
+    }
+
+    for (int x=-12; x<=23; ++x) for (int y=-18; y<=18; ++y)
+        wall.push_back({{x*.1F,y*.1F,0},{0,0,1}});
+    const auto measured=vista::application::estimate_room_layout(wall,reference,.05);
+    VISTA_CHECK(measured.floor==RoomLayoutFloor::measured);
+    VISTA_CHECK(measured.segments.size()==3);
+    const auto& supported=measured.segments[1];
+    VISTA_CHECK(!supported.inferred && measured.segments[2].inferred);
+    VISTA_CHECK_NEAR(supported.start[2],0,1e-6);
+    VISTA_CHECK_NEAR(supported.end[1],-.5,1e-6);
+    VISTA_CHECK_NEAR(measured.segments[2].end[1],upper.end[1],1e-6);
+}
+
+VISTA_TEST(gaussian_room_layout_preserves_open_doorways_and_dashes_short_gaps) {
+    std::vector<RoomLayoutSample> points;
+    for (int y=-30; y<=30; ++y) {
+        if (y>=13 && y<=15) continue; // 40 cm gap in the samples.
+        for (int z=(y>-5 && y<5 ? 21 : 2); z<=24; ++z)
+            points.push_back({{3,y*.1F,z*.1F},{1,0,0}}); // Wall above the doorway is still visible.
+    }
+    vista::application::RoomLayoutReference reference;
+    reference.lidar_position={0,0,.7};
+    reference.floor_datum=vista::models::RoomLayoutPosition{0,0,0};
+    const auto layout=vista::application::estimate_room_layout(points,reference,.05);
+    VISTA_CHECK(!layout.closed && layout.corners.empty());
+    std::size_t short_gaps=0;
+    for (const auto& segment : layout.segments) {
+        const auto lo=std::min(segment.start[1],segment.end[1]);
+        const auto hi=std::max(segment.start[1],segment.end[1]);
+        VISTA_CHECK(lo>=.49 || hi<=-.49);
+        if (lo<1.4 && hi>1.4) {
+            VISTA_CHECK(segment.inferred);
+            VISTA_CHECK_NEAR(hi-lo,.4,1e-6);
+            ++short_gaps;
+        }
+    }
+    VISTA_CHECK(short_gaps==2);
+}
+
+VISTA_TEST(gaussian_room_layout_keeps_parallel_walls_and_matches_oblique_ends) {
+    std::vector<RoomLayoutSample> points;
+    for (int i=0; i<=25; ++i) for (int z=5; z<=22; ++z) {
+        const auto t=i*.1F, h=z*.1F;
+        points.push_back({{2,-t,h},{1,0,0}});
+        points.push_back({{2+.6F*t,.8F*t,h},{.8F,-.6F,0}});
+        points.push_back({{5,t,h},{1,0,0}});
+    }
+    vista::application::RoomLayoutReference reference;
+    reference.lidar_position={0,0,.7};
+    reference.floor_datum=vista::models::RoomLayoutPosition{0,0,0};
+    const auto layout=vista::application::estimate_room_layout(points,reference,.05);
+    VISTA_CHECK(!layout.closed && layout.corners.size()==1);
+    VISTA_CHECK_NEAR(layout.corners[0].position[0],2,.06);
+    VISTA_CHECK_NEAR(layout.corners[0].position[1],0,.06);
+    for (const double offset : {2.,5.}) {
+        VISTA_CHECK(std::any_of(layout.segments.begin(),layout.segments.end(),[=](const auto& line) {
+            return std::abs(line.start[0]-offset)<.03 && std::abs(line.end[0]-offset)<.03 &&
+                std::abs(line.start[2])<.01 && std::abs(line.end[1]-line.start[1])>2.;
+        }));
+    }
+}
+VISTA_TEST(gaussian_room_layout_traces_short_low_ceiling_below_a_higher_ceiling_without_walls) {
+    std::vector<RoomLayoutSample> points;
+    for (int x=-8; x<=8; ++x) for (int y=-8; y<=8; ++y)
+        points.push_back({{x*.05F,y*.05F,1.48F},{0,0,1}});
+    for (int x=20; x<=64; ++x) for (int y=-22; y<=22; ++y)
+        points.push_back({{x*.05F,y*.05F,3.38F},{0,0,1}});
+    // A surface below the LiDAR and an isolated overhead strip are not ceiling patches.
+    for (int x=-10; x<=10; ++x) for (int y=-10; y<=10; ++y)
+        points.push_back({{x*.1F,y*.1F,.4F},{0,0,1}});
+    for (int x=-24; x<=24; ++x) points.push_back({{x*.05F,3.F,2.3F},{0,0,1}});
+    vista::application::RoomLayoutReference reference;
+    reference.lidar_position={0,0,.7};
+    reference.floor_datum=vista::models::RoomLayoutPosition{0,0,0};
+    const auto layout=vista::application::estimate_room_layout(points,reference,.05);
+    VISTA_CHECK(layout.corners.empty() && !layout.closed);
+    unsigned low=0, high=0;
+    for (const auto& line : layout.segments) {
+        VISTA_CHECK_NEAR(line.start[2],line.end[2],1e-6);
+        if (std::abs(line.start[2]-1.48)<.03) ++low;
+        else if (std::abs(line.start[2]-3.38)<.03) ++high;
+        else VISTA_CHECK(false);
+    }
+    VISTA_CHECK(low>=2 && high>=2);
+}
+
+VISTA_TEST(gaussian_room_layout_shares_the_segment_budget_across_six_ceiling_levels) {
+    constexpr std::array<float,6> heights{1.46F,2.04F,2.65F,3.21F,3.81F,4.39F};
+    std::vector<RoomLayoutSample> points;
+    for (std::size_t i=0; i<heights.size(); ++i) {
+        const auto half_width=8+static_cast<int>(i);
+        for (const float center : {-2.F,2.F})
+            for (int x=-half_width; x<=half_width; ++x)
+                for (int y=-half_width; y<=half_width; ++y)
+                    points.push_back({{center+x*.05F,y*.05F,heights[i]},{0,0,1}});
+    }
+    vista::application::RoomLayoutReference reference;
+    reference.lidar_position={0,0,.7};
+    const auto layout=vista::application::estimate_room_layout(points,reference,.05);
+    VISTA_CHECK(layout.corners.empty() && !layout.closed);
+    VISTA_CHECK(layout.segments.size()==32);
+    for (const auto height : heights) {
+        const auto traces=std::count_if(layout.segments.begin(),layout.segments.end(),[=](const auto& line) {
+            return !line.inferred && std::abs(line.start[2]-height)<.03 && std::abs(line.end[2]-height)<.03;
+        });
+        VISTA_CHECK(traces>=4);
+    }
+}
+
+VISTA_TEST(gaussian_room_layout_leaves_the_gap_between_ceiling_patches_open) {
+    std::vector<RoomLayoutSample> points;
+    for (int x=-18; x<=18; ++x) {
+        if (std::abs(x)<8) continue;
+        for (int y=-10; y<=10; ++y)
+            points.push_back({{x*.1F,y*.08F,2.F},{0,0,1}});
+    }
+    vista::application::RoomLayoutReference reference;
+    reference.lidar_position={0,0,.7};
+    const auto layout=vista::application::estimate_room_layout(points,reference,.05);
+    bool left=false, right=false;
+    for (const auto& line : layout.segments) {
+        VISTA_CHECK_NEAR(line.start[2],2,1e-6);
+        VISTA_CHECK_NEAR(line.end[2],2,1e-6);
+        VISTA_CHECK(line.start[0]*line.end[0]>0);
+        left=left || line.start[0]<0;
+        right=right || line.start[0]>0;
+    }
+    VISTA_CHECK(left && right);
+}
+
 VISTA_TEST(gaussian_room_layout_reuses_planar_cache_and_replaces_removed_walls) {
     auto cache=std::make_unique<Store>(vista::fs::path{},.1F,2.F,20000,32,2,2);
     cache->enable_surface_snapshots(true);
