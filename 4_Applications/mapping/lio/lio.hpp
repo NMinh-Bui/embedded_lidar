@@ -49,6 +49,7 @@ struct LioConfig {
     double minimum_range_m{0.5};
     double plane_threshold_m{0.10};
     double maximum_imu_gap_s{0.10};
+    std::size_t minimum_correspondences{30}; // Accepted point-to-plane matches per scan.
     double minimum_match_ratio{0.15};
     double maximum_residual_m{0.15};
     double maximum_translation_step_m{2.0};

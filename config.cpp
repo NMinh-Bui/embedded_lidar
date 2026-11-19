@@ -314,6 +314,8 @@ AppConfig parse_device_config_text(const std::string& contents) {
             config.lio.plane_threshold_m=parse_float(value,key);
         } else if (key == "liomaximugapmilliseconds") {
             config.lio.maximum_imu_gap_s=parse_float(value,key)/1000.0;
+        } else if (key == "liomincorrespondences") {
+            config.lio.minimum_correspondences=static_cast<std::size_t>(parse_unsigned(value,"LioMinCorrespondences",100'000));
         } else if (key == "liominmatchratio") {
             config.lio.minimum_match_ratio=parse_float(value,key);
         } else if (key == "liomaxresidualmeters") {

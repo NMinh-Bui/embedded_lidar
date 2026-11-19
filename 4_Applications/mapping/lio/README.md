@@ -105,6 +105,7 @@ fallback or algorithm-selection switch.
 | LioImuGyroscopeSaturation | Saturation per raw gyro axis | 35 |
 | LioMinRangeMeters | Minimum range for matching only | 0.5 |
 | LioPlaneThresholdMeters | Maximum neighbor-to-fitted-plane error | 0.1 |
+| LioMinCorrespondences | Minimum valid point-to-plane matches per scan (6 to LioScanMaxPoints) | 30 |
 
 All covariance values are diagonals, **not standard deviations**. Do not square
 them. The two pre-existing IMU covariance keys now control measurement R, not the
@@ -195,6 +196,14 @@ selected voxels. This allows the scan to attempt registration. It still needs
 enough correspondences, observable geometry, acceptable residual and pose step,
 and three consistent recovery scans after HOLDING. Compare pose stability and
 RoomMap growth on the same scene before lowering the setting further.
+
+If the diagnostic reports `insufficient LiDAR correspondences; matches=29/109;
+required_matches=30`, the scan reached registration and produced 29 matches.
+`LioMinCorrespondences` controls this post-registration count. The engine also
+checks geometry, match ratio, residual and pose consistency. In VISTA Edge
+Settings, **Point-LIO · Matching and Timing** shows the active value. Apply uses
+the session settings and restarts the LIO and mapping workers. Set the value in
+`DeviceConfig.txt` to use it at the next startup.
 
 After an accepted pose exists, insufficient selected points/correspondences or
 degenerate LiDAR geometry enter **HOLDING** (wire code 5). Pose/orientation and

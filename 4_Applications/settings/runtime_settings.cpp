@@ -106,6 +106,7 @@ const Field fields[]{
     {"LioMinRangeMeters", "lio_quality", true, [](const AppConfig& c) { return value(static_cast<float>(c.lio.minimum_range_m)); }},
     {"LioPlaneThresholdMeters", "lio_quality", true, [](const AppConfig& c) { return value(static_cast<float>(c.lio.plane_threshold_m)); }},
     {"LioMaxImuGapMilliseconds", "lio_quality", true, [](const AppConfig& c) { return value(static_cast<float>(c.lio.maximum_imu_gap_s * 1000)); }},
+    {"LioMinCorrespondences", "lio_quality", true, [](const AppConfig& c) { return value(c.lio.minimum_correspondences); }},
     {"LioMinMatchRatio", "lio_quality", true, [](const AppConfig& c) { return value(static_cast<float>(c.lio.minimum_match_ratio)); }},
     {"LioMaxResidualMeters", "lio_quality", true, [](const AppConfig& c) { return value(static_cast<float>(c.lio.maximum_residual_m)); }},
     {"LioMaxTranslationStepMeters", "lio_quality", true, [](const AppConfig& c) { return value(static_cast<float>(c.lio.maximum_translation_step_m)); }},

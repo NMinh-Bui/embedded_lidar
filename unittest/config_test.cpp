@@ -270,6 +270,17 @@ VISTA_TEST(config_lio_minimum_scan_points_default_override_and_bounds) {
     VISTA_CHECK_THROWS(vista::parse_device_config_text(base+"\nLioScanMaxPoints: 100\nLioScanMinPoints: 101\n"));
 }
 
+VISTA_TEST(config_lio_minimum_correspondences_default_override_and_bounds) {
+    const std::string base=quanergy_config;
+    VISTA_CHECK(vista::parse_device_config_text(base).lio.minimum_correspondences==30);
+    VISTA_CHECK(vista::parse_device_config_text(base+"\nLioMinCorrespondences: 28\n").lio.minimum_correspondences==28);
+    VISTA_CHECK(vista::parse_device_config_text(base+"\nLioMinCorrespondences: 6\n").lio.minimum_correspondences==6);
+    VISTA_CHECK(vista::parse_device_config_text(base+"\nLioScanMaxPoints: 100\nLioMinCorrespondences: 100\n").lio.minimum_correspondences==100);
+    for (const auto* value : {"0","5","-1","28.5","nan"})
+        VISTA_CHECK_THROWS(vista::parse_device_config_text(base+"\nLioMinCorrespondences: "+value+"\n"));
+    VISTA_CHECK_THROWS(vista::parse_device_config_text(base+"\nLioScanMaxPoints: 100\nLioMinCorrespondences: 101\n"));
+}
+
 VISTA_TEST(config_room_mapping_settings_and_independent_mounting) {
     const auto config=vista::parse_device_config_text(std::string(quanergy_config)+R"(
 MountZ(lidar): 2.5

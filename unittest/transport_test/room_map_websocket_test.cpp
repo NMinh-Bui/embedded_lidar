@@ -357,6 +357,13 @@ VISTA_TEST(settings_apply_validates_complete_candidate_and_keeps_defaults_in_mem
     VISTA_CHECK(snapshot.at("LioImuAccelerationCovariance")=="0.1");
     VISTA_CHECK(snapshot.at("LioImuGyroscopeCovariance")=="0.12");
     VISTA_CHECK(snapshot.at("Camera")=="None" && snapshot.at("Radar")=="None");
+    VISTA_CHECK(snapshot.at("LioMinCorrespondences")=="30");
+    const auto matching=apply("lio_quality",{{"LioMinCorrespondences","28"}});
+    VISTA_CHECK(matching.config.lio.minimum_correspondences==28);
+    VISTA_CHECK(matching.changes.size()==1);
+    VISTA_CHECK(settings_change_line("LioMinCorrespondences",matching.changes.at("LioMinCorrespondences"))==
+        "[settings] LioMinCorrespondences \"30\" -> \"28\"");
+    VISTA_CHECK(parse_device_config_text(text).lio.minimum_correspondences==30);
     auto paired = apply("lio_noise",{{"LioImuAccelerationCovariance","0.2"},{"LioImuGyroscopeCovariance","0.2"}});
     VISTA_CHECK(paired.changes.size()==2);
     VISTA_CHECK(settings_change_line("LioImuGyroscopeCovariance",paired.changes.at("LioImuGyroscopeCovariance"))==
@@ -371,6 +378,8 @@ VISTA_TEST(settings_apply_validates_complete_candidate_and_keeps_defaults_in_mem
     };
     VISTA_CHECK(rejected("lio_noise",{{"LioImuAccelerationCovariance","0.2"},{"LioImuGyroscopeCovariance","-1"}}));
     VISTA_CHECK(rejected("logging",{{"LioEnabled","0"}}));
+    VISTA_CHECK(rejected("lio_quality",{{"LioMinCorrespondences","5"}}));
+    VISTA_CHECK(rejected("lio_scan",{{"LioMinCorrespondences","28"}}));
     VISTA_CHECK(rejected("camera",{{"Camera","RealSense"}}));
     VISTA_CHECK(rejected("room_map_io",{{"RoomMapWebSocketPort","9988"}}));
     VISTA_CHECK(rejected("logging",{{"RawLoggingEnabled","1\nLidar: unitree-l2"}}));

@@ -240,7 +240,7 @@ public:
         const double pose_min=poses.info()==Eigen::Success?poses.eigenvalues().minCoeff():-1;
         const auto corrected=filter.get_x();const auto reference=last_accepted.value_or(saved_state);
         std::string failure;
-        if(matches<30)failure="insufficient LiDAR correspondences";
+        if(matches<config.minimum_correspondences)failure="insufficient LiDAR correspondences";
         else if(normal_min<=1e-3 || pose_min<=1e-4)failure="degenerate LiDAR geometry";
         else if(ratio<config.minimum_match_ratio)failure="LiDAR match ratio below limit";
         else if(residual>config.maximum_residual_m)failure="LiDAR residual above limit";
@@ -254,7 +254,7 @@ public:
             robustifier=saved_robustifier;imu_r_scales=saved_r_scales;
             std::size_t cursor=0;while(cursor<scan.imu.size() && scan.imu[cursor].time_s<=last_imu_update+1e-10)++cursor;
             advance(scan.end_s,scan.imu,cursor);remember();prune_history();
-            std::ostringstream r;r.imbue(std::locale::classic());r<<failure<<"; matches="<<matches<<"/"<<examined<<"; ratio="<<ratio<<"; residual_m="<<residual<<"; normal_eigen_min="<<normal_min<<"; pose_eigen_min="<<pose_min;
+            std::ostringstream r;r.imbue(std::locale::classic());r<<failure<<"; matches="<<matches<<"/"<<examined<<"; required_matches="<<config.minimum_correspondences<<"; ratio="<<ratio<<"; residual_m="<<residual<<"; normal_eigen_min="<<normal_min<<"; pose_eigen_min="<<pose_min;
             if(last_accepted && (failure=="insufficient LiDAR correspondences" || failure=="degenerate LiDAR geometry"))
                 return hold_geometry(scan,r.str());
             return reject(r.str());

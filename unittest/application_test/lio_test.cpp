@@ -318,6 +318,40 @@ LioScan scan(double begin,bool room=true) {
     return s;
 }
 }
+VISTA_TEST(lio_minimum_correspondences_controls_marginal_scan_acceptance) {
+    for (const std::size_t minimum : {std::size_t{30}, std::size_t{28}}) {
+        LioConfig config;
+        config.scan_voxel_m=.10;
+        config.map_voxel_m=.10;
+        config.scan_min_points=30;
+        config.minimum_correspondences=minimum;
+        LioEngine engine(config);
+        LioOutput output;
+        for (int i=0;i<12;++i) output=engine.process(scan(i*.1));
+        VISTA_CHECK(output.status.pose_valid && output.world_cloud);
+        const auto pose=output.status.position_m;
+        const auto map_points=output.status.local_map_points;
+
+        auto sparse=scan(1.2);
+        const auto room=std::move(sparse.cloud.points);
+        // 29 widely distributed points from three planes plus one unmatched return.
+        for (std::size_t i=0;i<29;++i) sparse.cloud.points.push_back(room[i*61]);
+        auto unmatched=room.back();
+        unmatched.x+=20;
+        sparse.cloud.points.push_back(unmatched);
+        output=engine.process(sparse);
+        if (minimum==30) {
+            VISTA_CHECK(output.status.state==vista::models::LocalizationState::holding);
+            VISTA_CHECK(!output.status.pose_valid && !output.world_cloud);
+            VISTA_CHECK(output.status.reason.find("matches=29/30; required_matches=30")!=std::string::npos);
+            VISTA_CHECK(output.status.local_map_points==map_points && output.status.position_m==pose);
+        } else {
+            if (!output.status.pose_valid || !output.world_cloud) throw std::runtime_error(output.status.reason);
+            for (std::size_t i=0;i<pose.size();++i) VISTA_CHECK_NEAR(output.status.position_m[i],pose[i],.02);
+        }
+    }
+}
+
 VISTA_TEST(lio_holding_preserves_wire_codes_and_never_triggers_lost_recovery_timer) {
     using S=vista::models::LocalizationState;
     VISTA_CHECK(static_cast<unsigned>(S::waiting_imu)==0 && static_cast<unsigned>(S::lost)==4 && static_cast<unsigned>(S::holding)==5);
