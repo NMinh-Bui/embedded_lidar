@@ -1,12 +1,13 @@
 # Gaussian Full Surface / Edges / Corners
 
-The Grafana Gaussian/Foreground panel supports three display modes:
+The Grafana Gaussian/Foreground panel offers two surface modes:
 
 - **Full Surface**: all fitted Gaussian surface samples, within the view budget.
 - **Edges** (default): supported geometric creases, curved/linear features, and surface boundaries.
-- **Corners**: the room outline estimated from confirmed walls. Cyan solid
-  segments have point support. Amber dashed segments show extrapolation and
-  any vertical or floor edges without direct support.
+
+The **Corners** checkbox overlays the room outline estimated from confirmed walls.
+Cyan solid segments have point support. Amber dashed segments show extrapolation
+and vertical or floor edges without direct support.
 
 The Foreground checkbox and its stream remain independent. These are geometric
 features, not semantic object outlines or motion detections. Sparse sampling,
@@ -58,26 +59,21 @@ explicitly selects the full surface; omitting it preserves the legacy behavior.
 Extra tokens and unknown modes are rejected. The ordinary RoomMap endpoint
 rejects `EDGES` and `CORNERS` and serves complete RoomMap LOD.
 
-Gaussian metadata includes `supportsEdges`, `supportsRoomLayout` and
-`surfaceMode`. In Corners mode the metadata contains versioned `roomLayout`
-coordinates and support flags, followed by an empty GSP1 replacement frame.
-The outline does not depend on camera motion. Existing radius values in
-DeviceConfig files and old CORNERS requests are accepted for compatibility.
-Mode changes bypass the camera cooldown. The panel uses the metadata and frame
-from the selected mode and map revision.
+Gaussian metadata includes `supportsEdges`, `supportsRoomLayoutOverlay` and
+`surfaceMode`. On the same Gaussian WebSocket, `ROOM LAYOUT ON` subscribes to
+the current and subsequent `room-layout` messages. `ROOM LAYOUT OFF` stops
+updates for that viewer. The separate messages carry a map generation and a
+versioned outline. Toggling the overlay does not request new splats. The older
+`CORNERS` view and its optional radius remain accepted for archived plugins.
 
 ## Deployment
 
 Build and restart `vista_edge` on ADLINK. Update the existing
-`vista-lidarpointcloud-panel` Grafana plugin with version 1.11.0 from the parent
+`vista-lidarpointcloud-panel` Grafana plugin with version 1.12.0 from the parent
 VISTA repository (`dashboard/plugins/lidarpointcloud/dist`), restart Grafana and
 hard-refresh the browser. The panel sources are outside this embedded submodule.
 
-Select a mode in the panel toolbar. Save the dashboard to
-retain the selection (`options.gaussianSurfaceMode`). Existing V5/V6 dashboards
-default to Edges when no mode has been saved. Previously saved Full Surface
-choices are preserved; choose Edges and save, or import the updated V5/V6 JSON.
-The Foreground checkbox still controls only Foreground.
-
-The panel uses the existing Gaussian WebSocket. It enables each derived view
-when the edge application advertises support in its metadata.
+Select Edges or Full Surface in the panel toolbar and check Corners to show
+the outline. Save the dashboard to keep the selections. Existing V5/V6 dashboards
+default to Edges when no mode has been saved. A saved legacy Corners mode appears
+as Edges with Corners checked. The Foreground checkbox remains independent.

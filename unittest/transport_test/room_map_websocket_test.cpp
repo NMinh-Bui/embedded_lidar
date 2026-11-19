@@ -604,6 +604,14 @@ VISTA_TEST(gaussian_websocket_switches_modes_on_frozen_map_without_camera_cooldo
     const auto metadata=client.read_frame();const std::string text(metadata.second.begin(),metadata.second.end());
     VISTA_CHECK(text.find("\"supportsEdges\":true")!=std::string::npos && text.find("\"surfaceMode\":\"edges\"")!=std::string::npos);
     VISTA_CHECK(client.read_frame().second.size()==32+2*44);
+    VISTA_CHECK(text.find(R"("supportsRoomLayoutOverlay":true)")!=std::string::npos);
+    client.send_bytes(masked_text("ROOM LAYOUT ON"));
+    const auto overlay=client.read_frame();
+    const std::string overlay_text(overlay.second.begin(),overlay.second.end());
+    VISTA_CHECK(overlay.first==1 && overlay_text.find(R"("type":"room-layout")")!=std::string::npos);
+    VISTA_CHECK(overlay_text.find(R"("corners":[[1,2,3,false],[4,2,3,true]])")!=std::string::npos);
+    client.send_bytes(masked_text(view));
+    VISTA_CHECK(client.read_frame().first==1);VISTA_CHECK(client.read_frame().second.size()==32+3*44);
     client.send_bytes(masked_text(view+" CORNERS"));
     const auto corner_metadata=client.read_frame();
     const std::string corner_text(corner_metadata.second.begin(),corner_metadata.second.end());
@@ -616,8 +624,21 @@ VISTA_TEST(gaussian_websocket_switches_modes_on_frozen_map_without_camera_cooldo
     client.send_bytes(masked_text(view));
     VISTA_CHECK(client.read_frame().first==1);VISTA_CHECK(client.read_frame().second.size()==32+3*44);
     VISTA_CHECK(std::chrono::steady_clock::now()-start<2s);
-    publisher.publish({std::make_shared<Source>(),2,2,3,vista::models::RoomMapState::frozen});
+    publisher.publish({std::make_shared<Source>(),2,2,3,vista::models::RoomMapState::frozen,0,1});
+    const auto updated=client.read_frame();
+    const std::string updated_text(updated.second.begin(),updated.second.end());
+    VISTA_CHECK(updated_text.find(R"("type":"room-layout","mappingGeneration":1)")!=std::string::npos);
+    VISTA_CHECK(client.read_frame().first==1);VISTA_CHECK(client.read_frame().second.size()==32+3*44);
     VISTA_CHECK(second.read_frame().first==1);VISTA_CHECK(second.read_frame().second.size()==32+3*44);
+    // Both controls may arrive in the same TCP read. The mode change serves as
+    // a barrier before we verify that subsequent checkpoints omit the outline.
+    auto batch=masked_text("ROOM LAYOUT OFF");
+    const auto edges_request=masked_text(view+" EDGES");
+    batch.insert(batch.end(),edges_request.begin(),edges_request.end());
+    client.send_bytes(batch);
+    VISTA_CHECK(client.read_frame().first==1);VISTA_CHECK(client.read_frame().second.size()==32+2*44);
+    publisher.publish({std::make_shared<Source>(),3,3,3,vista::models::RoomMapState::frozen,0,1});
+    VISTA_CHECK(client.read_frame().first==1);VISTA_CHECK(client.read_frame().second.size()==32+2*44);
     stop.request_stop();bus.close();worker.join();VISTA_CHECK(failure.empty());
 }
 

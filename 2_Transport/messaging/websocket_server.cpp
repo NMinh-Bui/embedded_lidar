@@ -603,9 +603,13 @@ std::vector<WebSocketTextMessage> WebSocketServer::poll_text() {
                 failed=!send_all(it->socket,header.data(),header.size()) ||
                     !send_all(it->socket,reinterpret_cast<const std::uint8_t*>(payload.data()),payload.size());
             } else if(opcode==1) {
-                // Coalesce requests from the same panel: only its newest view matters.
-                const auto found=std::find_if(result.begin(),result.end(),[&](const auto& m){return m.client_id==it->id;});
-                if(found==result.end()) result.push_back({it->id,std::move(payload)});else found->text=std::move(payload);
+                // Coalesce successive camera views while preserving independent control commands.
+                if (!result.empty() && result.back().client_id==it->id &&
+                    result.back().text.rfind("VIEW ",0)==0 && payload.rfind("VIEW ",0)==0) {
+                    result.back().text=std::move(payload);
+                } else {
+                    result.push_back({it->id,std::move(payload)});
+                }
             }
         }
         if(failed) {close_socket(it->socket);it=clients.erase(it);}else ++it;

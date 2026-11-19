@@ -179,6 +179,8 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                 models::RoomMapViewRequest request;
                 std::string requested_signature,sent_signature,sent_control_state,sent_pose;
                 bool wants_pose{};
+                bool wants_layout{};
+                std::weak_ptr<const models::RoomMapViewMessage> sent_layout;
                 std::uint64_t sent_revision{};
                 models::RoomMapState sent_state{models::RoomMapState::empty};
                 bool delivered{};
@@ -235,6 +237,12 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                             found->second.wants_pose=true;
                             continue;
                         }
+                        if (config.gaussian_map && (incoming.text=="ROOM LAYOUT ON" || incoming.text=="ROOM LAYOUT OFF")) {
+                            auto& view=found->second;
+                            view.wants_layout=incoming.text=="ROOM LAYOUT ON";
+                            if (!view.wants_layout) view.sent_layout.reset();
+                            continue;
+                        }
                         if (!config.gaussian_map && incoming.text.rfind("MAPPING ", 0) == 0) {
                             try {
                                 request_mapping_change(incoming.text, config.mapping_control);
@@ -281,8 +289,24 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                     if(!latest) continue;
                     // Each client has its own camera and bounded view. Frozen maps
                     // send only on camera changes/reconnect, not every polling tick.
+                    std::optional<std::string> layout_text;
                     for(auto& entry:views) {
                         auto& view=entry.second;
+                        if (view.wants_layout && view.sent_layout.lock()!=latest) {
+                            if (!layout_text) {
+                                std::ostringstream payload;
+                                payload.imbue(std::locale::classic());
+                                payload.precision(15);
+                                payload<<R"({"type":"room-layout","mappingGeneration":)"<<latest->mapping_generation
+                                    <<R"(,"roomLayout":)";
+                                const auto source=std::dynamic_pointer_cast<const models::GaussianMapViewSource>(latest->source);
+                                write_room_layout(payload,source && latest->state<models::RoomMapState::disabled ?
+                                    source->room_layout() : nullptr);
+                                payload<<'}';
+                                layout_text=payload.str();
+                            }
+                            if (server->send_text(entry.first,*layout_text)) view.sent_layout=latest;
+                        }
                         const bool map_changed=!view.delivered || view.sent_revision!=latest->revision ||
                             view.sent_state!=latest->state;
                         const bool mode_changed=view.delivered && view.sent_mode!=view.request.surface_mode;
@@ -322,7 +346,7 @@ platform::WorkerHandle spawn_room_map_websocket(platform::MessageBus& bus,
                             <<",\"supportsLidarPose\":true,\"bounds\":[";
                         for(unsigned i=0;i<6;++i) {if(i) meta<<',';meta<<bounds[i];}meta<<"]";
                         if(config.gaussian_map) {
-                            meta<<",\"supportsEdges\":true,\"supportsRoomLayout\":true,\"surfaceMode\":\""
+                            meta<<",\"supportsEdges\":true,\"supportsRoomLayout\":true,\"supportsRoomLayoutOverlay\":true,\"surfaceMode\":\""
                                 <<surface_mode_name(view.request.surface_mode)<<'"';
                             if (show_layout) {
                                 meta<<",\"roomLayout\":";
